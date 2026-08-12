@@ -1,0 +1,82 @@
+[build-system]
+# Use the legacy setuptools backend so the existing `setup.py` (which dynamically
+# detects torch and builds C/CUDA extensions via torch.utils.cpp_extension)
+# is still executed during build. This is a minimal, non-opinionated pyproject
+# that modernizes the package while preserving the custom extension build steps.
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+# Note:
+# - Building the torch extensions requires a working PyTorch installation
+#   available at build time (or FORCE_CUDA=1 for cross-compilation). We keep
+#   the extension-building logic in `setup.py` because it needs to import
+#   `torch` at build time to select CUDA/Cpp extension classes.
+# - If you prefer a pure PEP 517 build without a legacy setup.py, we can
+#   refactor the extension-building logic into a custom build backend plugin.
+
+[project]
+name = "embodichain"
+description = "An end-to-end, GPU-accelerated, and modular platform for building generalized Embodied Intelligence."
+readme = "README.md"
+authors = [ { name = "EmbodiChain Developers" } ]
+requires-python = ">=3.10"
+dynamic = ["version"]
+
+# Core install dependencies (kept from requirements.txt). Some VCS links are
+# specified using PEP 508 direct references where present.
+dependencies = [
+  "dexsim_engine==0.4.3",
+  "setuptools>=78.1.1",
+  "gymnasium>=0.29.1",
+  "langchain",
+  "langchain-openai",
+  "toppra==0.6.3",
+  "pin",
+  "pin-pink",
+  "casadi",
+  "qpsolvers[osqp]==4.8.1",
+  "pytorch_kinematics==0.10.0",
+  "polars==1.31.0",
+  "PyYAML>=6.0",
+  "wandb>=0.21.0",
+  "tensorboard>=2.20.0",
+  "ortools",
+  "prettytable",
+  "black==26.3.1",
+  "fvcore",
+  "h5py",
+  "tensordict",
+  "viser==1.0.21",
+  "lerobot>=0.4.4"
+]
+
+[project.optional-dependencies]
+gensim = [
+  "bpy",
+  "pyrender==0.1.45"
+]
+
+[tool.uv.sources]
+bpy = { index = "blender" }
+
+[[tool.uv.index]]
+name = "blender"
+url = "https://download.blender.org/pypi/"
+
+[tool.setuptools.dynamic]
+version = { file = ["VERSION"] }
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["docs"]
+
+[tool.black]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "requires_sim: marks tests that require a real simulation backend",
+    "gpu: marks tests that execute CUDA/GPU code (run serially)",
+    "renderer: marks tests that exercise a rendering backend",
+]

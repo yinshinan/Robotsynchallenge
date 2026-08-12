@@ -1,0 +1,8 @@
+=========================================
+Executing task: handle_basket (random)
+GYM_CONFIG: configs/handle_basket/random/gym_config.json
+ACTION_CONFIG: configs/handle_basket/action_config.json
+=========================================
+Running command:
+python -m scripts.run_env --gym_config configs/handle_basket/random/gym_config.json --action_config configs/handle_basket/action_config.json --num_envs 1 <br/ 1 <br/ <br/
+=========================================

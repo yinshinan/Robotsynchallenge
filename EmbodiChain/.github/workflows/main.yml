@@ -1,0 +1,216 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'  # Match tags starting with v, e.g., v1.0.0
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: Linux
+    env:
+      NVIDIA_DRIVER_CAPABILITIES: all
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DISABLE_REQUIRE: 1
+    container: &container_template
+      image: 192.168.3.13:5000/dexsdk:ubuntu22.04-cuda12.8.0-h5ffmpeg-v3-py311
+      volumes:
+        - "/cache:/cache"
+        - "/usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d"
+        - "/usr/share/vulkan/implicit_layer.d:/usr/share/vulkan/implicit_layer.d"
+        - "/usr/share/glvnd/egl_vendor.d:/usr/share/glvnd/egl_vendor.d"
+        - "/tmp/.X11-unix:/tmp/.X11-unix"
+        - "/dev/shm/shared:/dev/shm/shared"
+        - "/usr/share/nvidia:/usr/share/nvidia"
+      options: --memory 100g --gpus device=0 --shm-size 53687091200
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/activate-conda
+      - name: Code Style check
+        run: |
+          echo "Workspace: ${GITHUB_WORKSPACE}"
+          ls
+          pip install black==26.3.1
+          black --check --diff --color ./
+          if [ $? -ne 0 ]; then
+            echo "Code style check failed, please run [black ./] before commit!"
+            exit 1
+          fi
+
+  build:
+    needs: lint
+    runs-on: Linux
+    env:
+      NVIDIA_DRIVER_CAPABILITIES: all
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DISABLE_REQUIRE: 1
+      DOCS_MAX_VERSIONS: 5
+    container: *container_template
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/activate-conda
+
+      - name: Cache Python dependencies
+        id: cache-pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-docs-${{ hashFiles('docs/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-docs-
+
+      # Restore the full multi-version site from the last successful build.
+      # The key never matches exactly (run_id is unique), so restore-keys is
+      # always used to pick up the most recently saved full site.
+      - name: Restore full multi-version docs site
+        if: github.event_name == 'push'
+        uses: actions/cache/restore@v4
+        with:
+          path: docs/build/html
+          key: docs-full-site-${{ github.repository }}-${{ github.run_id }}
+          restore-keys: |
+            docs-full-site-${{ github.repository }}-
+
+      # Tag-scoped caches are invisible on main; merge live Pages so releases survive.
+      - name: Merge versions from live GitHub Pages
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          SITE_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          SKIP_VERSION="main"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            SKIP_VERSION="${GITHUB_REF_NAME}"
+          fi
+          python3 ${GITHUB_WORKSPACE}/docs/scripts/merge_published_site.py \
+            --build-dir ${GITHUB_WORKSPACE}/docs/build/html \
+            --site-base-url "${SITE_URL}" \
+            --skip-version "${SKIP_VERSION}"
+
+      - name: Build docs
+        shell: bash
+        run: |
+          pip install -e ".[gensim]" \
+            --extra-index-url http://pyp.open3dv.site:2345/simple/ \
+            --trusted-host pyp.open3dv.site \
+            --extra-index-url https://download.blender.org/pypi/
+          pip install -r docs/requirements.txt
+          python3 docs/scripts/sync_readme.py
+          cd ${GITHUB_WORKSPACE}/docs
+          pip uninstall pymeshlab -y
+          pip install pymeshlab==2023.12.post3
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+            echo "Building docs for release tag ${VERSION}..."
+            sphinx-build source build/html/${VERSION}
+
+            cd build/html
+
+            # Prune old release versions beyond the window
+            mapfile -t TAG_DIRS < <(ls -d v*/ 2>/dev/null | sort -V)
+            while [[ ${#TAG_DIRS[@]} -gt ${DOCS_MAX_VERSIONS:-5} ]]; do
+              echo "Pruning old version: ${TAG_DIRS[0]}"
+              rm -rf "${TAG_DIRS[0]}"
+              TAG_DIRS=("${TAG_DIRS[@]:1}")
+            done
+
+          else
+            echo "Building dev docs for main branch..."
+            # Only rebuild main/ — other versions come from cache + live Pages merge
+            rm -rf build/html/main
+            sphinx-build source build/html/main
+            cd build/html
+          fi
+
+          # Regenerate versions.json and root index.html from all present dirs
+          python3 ${GITHUB_WORKSPACE}/docs/scripts/generate_versions_json.py \
+            --build-dir .
+
+      # Default-branch cache only (tag-scoped caches are not visible on main).
+      - name: Save full multi-version docs site
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: docs/build/html
+          key: docs-full-site-${{ github.repository }}-${{ github.run_id }}
+
+      - name: Upload docs site artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-site
+          path: ${{ github.workspace }}/docs/build/html
+
+  test:
+    if: github.event_name == 'pull_request'
+    needs: lint
+    runs-on: Linux
+    env:
+      NVIDIA_DRIVER_CAPABILITIES: all
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DISABLE_REQUIRE: 1
+    container: *container_template
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/activate-conda
+      - name: Install test package
+        run: |
+          pip install -e ".[gensim]" \
+            --extra-index-url http://pyp.open3dv.site:2345/simple/ \
+            --trusted-host pyp.open3dv.site \
+            --extra-index-url https://download.blender.org/pypi/
+          pip install pytest-xdist
+
+      - name: Run default tests
+        run: |
+          echo "Default test suite (GPU-marked tests are skipped)"
+          export HF_ENDPOINT=https://hf-mirror.com
+          pytest tests/docs -q --confcutdir=tests/docs
+          pytest tests
+
+      - name: Run GPU tests serially
+        run: |
+          echo "Dedicated GPU test suite"
+          export HF_ENDPOINT=https://hf-mirror.com
+          pytest tests --run-gpu -m gpu
+
+  release-build:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: lint
+    runs-on: Linux
+
+    container: *container_template
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/activate-conda
+
+      - name: (Release) Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: (Release) Build sdist and wheel
+        run: |
+          python -m build
+
+      # - name: (Release) Create GitHub Release (draft)
+      #   uses: softprops/action-gh-release@v2
+      #   with:
+      #     draft: true
+      #     generate_release_notes: true
+      #     files: |
+      #       dist/*
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: (Release) Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/

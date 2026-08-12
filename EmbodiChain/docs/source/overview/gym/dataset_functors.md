@@ -1,0 +1,156 @@
+# Dataset Functors
+
+```{currentmodule} embodichain.lab.gym.envs.managers
+```
+
+This page lists all available dataset functors that can be used with the Dataset Manager. Dataset functors are configured using {class}`~cfg.DatasetFunctorCfg` and are responsible for collecting and saving episode data during environment interaction.
+
+```{note}
+This page covers structured dataset export. If you only need human-viewable debug or demo videos from a fixed camera, use {class}`~record.record_camera_data` on {doc}`event_functors`.
+```
+
+````{tip}
+**Using an AI coding agent?** Use the **`/add-functor`** skill to scaffold a new dataset functor with the correct signature, `DatasetFunctorCfg` registration, and module placement in `datasets.py`.
+````
+
+## Recording Functors
+
+```{list-table} Dataset Recording Functors
+:header-rows: 1
+:widths: 25 75
+
+* - Functor Name
+  - Description
+* - {class}`~datasets.LeRobotRecorder`
+  - Records episodes in LeRobot dataset format. Handles observation-action pair recording, format conversion, and episode saving. Requires LeRobot package to be installed.
+
+    ```json
+    {"func": "LeRobotRecorder", "mode": "save",
+     "params": {"robot_meta": {"robot_type": "CobotMagic", "control_freq": 25},
+                "instruction": {"lang": "Pour water from bottle to cup"},
+                "extra": {"scene_type": "Commercial",
+                          "task_description": "Pour water",
+                          "data_type": "sim"},
+                "use_videos": true}}
+    ```
+```
+
+## LeRobotRecorder
+
+The ``LeRobotRecorder`` functor enables recording robot learning episodes in the LeRobot dataset format, which can be used for training with LeRobot's imitation learning algorithms.
+
+### Features
+
+- Records observation-action pairs during episodes
+- Converts data to LeRobot format automatically
+- Saves episodes when they complete
+- Supports vision sensors (camera images)
+- Supports robot state (qpos, qvel, qf)
+- Supports custom observation features
+- Auto-incrementing dataset naming
+
+### Parameters
+
+```{list-table} LeRobotRecorder Parameters
+:header-rows: 1
+:widths: 30 70
+
+* - Parameter
+  - Description
+* - ``save_path``
+  - Root directory for saving datasets. Defaults to EmbodiChain's default dataset root.
+* - ``robot_meta``
+  - Robot metadata for dataset (robot_type, control_freq, etc.)
+* - ``instruction``
+  - Optional task instruction (e.g., {"lang": "pick the cube"})
+* - ``extra``
+  - Optional extra metadata (scene_type, task_description, episode_info)
+* - ``use_videos``
+  - Whether to save videos (True) or images (False). Default: False.
+* - ``image_writer_threads``
+  - Number of threads for image writing
+* - ``image_writer_processes``
+  - Number of processes for image writing
+```
+
+### Recorded Data
+
+The LeRobotRecorder saves the following data for each frame:
+
+- ``observation.state``: Joint positions (proprioceptive state)
+- ``action``: Applied action
+- ``observation.images.{sensor_name}``: Camera images (if sensors present)
+- ``observation.images.{sensor_name}_right``: Right camera images (for stereo cameras)
+
+### Dataset Recording vs Video Recording
+
+```{list-table} Recording Options
+:header-rows: 1
+:widths: 30 35 35
+
+* - Need
+  - Use
+  - Why
+* - Training or imitation-learning data
+  - {class}`~datasets.LeRobotRecorder`
+  - Saves structured observation, action, and metadata for downstream pipelines.
+* - Quick qualitative inspection or demos
+  - {class}`~record.record_camera_data`
+  - Saves MP4 videos from a dedicated camera without creating a training dataset.
+```
+
+## Usage Example
+
+```python
+from embodichain.lab.gym.envs.managers.cfg import DatasetFunctorCfg
+
+# Example: Record episodes in LeRobot format
+dataset = {
+    "lerobot_recorder": DatasetFunctorCfg(
+        func="embodichain.lab.gym.envs.managers.datasets.LeRobotRecorder",
+        params={
+            "save_path": "/path/to/dataset/root",
+            "robot_meta": {
+                "robot_type": "dexforce_w1",
+                "control_freq": 30,
+            },
+            "instruction": {
+                "lang": "pick the cube and place it on the target",
+            },
+            "extra": {
+                "scene_type": "table",
+                "task_description": "pick_and_place",
+                "episode_info": {
+                    "rigid_object_physics_attributes": ["mass"],
+                },
+            },
+            "use_videos": False,
+        },
+    ),
+}
+```
+
+### Recording Workflow
+
+1. **Initialization**: The Dataset Manager initializes the functor with the configured parameters
+2. **Data Collection**: During episode rollout, the functor receives observations and actions
+3. **Save Trigger**: When an episode completes, call the functor with `mode="save"`
+4. **Finalization**: After all episodes, call `finalize()` to save any remaining data
+
+```python
+# Inside environment loop
+if episode_done:
+    dataset_manager.apply(mode="save", env_ids=completed_env_ids)
+
+# After training completes
+dataset_manager.apply(mode="finalize")
+```
+
+## Dataset Manager Modes
+
+The Dataset Manager supports the following modes:
+
+- ``save``: Save completed episodes for specified environment IDs
+- ``finalize``: Finalize the dataset and save any remaining data
+
+See {class}`~managers.dataset_manager.DatasetManager` for more details.

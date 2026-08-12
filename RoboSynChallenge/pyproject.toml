@@ -1,0 +1,40 @@
+[project]
+name = "robosynchallenge"
+description = "Template repository for building Embodied AI task environment using EmbodiChain."
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["version"]
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "To be determined"}
+]
+keywords = ["robotics", "embodied-ai", "manipulation", "simulation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+]
+
+[project.urls]
+Repository = "https://github.com/EDEM-AI/RoboSynChallenge"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["docs"]
+
+[tool.setuptools.dynamic]
+version = { file = ["RoboSynChallenge/VERSION"] }
+
+[tool.black]

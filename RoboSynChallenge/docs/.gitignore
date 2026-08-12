@@ -1,0 +1,24 @@
+# docs build outputs
+_site/
+site/
+_build/
+.vitepress/dist/
+.docusaurus/
+build/
+
+# docs caches
+.cache/
+.jekyll-cache/
+.sass-cache/
+doctrees/
+.doctrees/
+.ipynb_checkpoints/
+html/.buildinfo.bak
+html/_images/
+html/_static/base-stemmer.js
+html/_static/english-stemmer.js
+*.bak
+.buildinfo.bak
+
+# local
+.DS_Store

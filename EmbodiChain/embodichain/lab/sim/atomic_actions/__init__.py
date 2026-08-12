@@ -1,0 +1,120 @@
+# ----------------------------------------------------------------------------
+# Copyright (c) 2021-2026 DexForce Technology Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ----------------------------------------------------------------------------
+
+"""Atomic action abstraction layer for embodied AI motion generation.
+
+This module provides a unified interface for the atomic motion primitives
+(``move_end_effector``, ``move_joints``, ``pick_up``, ``move_held_object``,
+``place``, ``press``, ``coordinated_pickment``, ``coordinated_placement``),
+with typed targets, a ``WorldState`` threaded across sequenced actions, and
+extensible custom action registration.
+"""
+
+from __future__ import annotations
+
+from .affordance import (
+    Affordance,
+    AntipodalAffordance,
+    InteractionPoints,
+)
+from .core import (
+    ActionCfg,
+    ActionResult,
+    AtomicAction,
+    CoordinatedHeldObjectState,
+    CoordinatedPickmentTarget,
+    CoordinatedPlacementTarget,
+    GraspTarget,
+    HeldObjectState,
+    HeldObjectPoseTarget,
+    JointPositionTarget,
+    NamedJointPositionTarget,
+    ObjectSemantics,
+    EndEffectorPoseTarget,
+    Target,
+    WorldState,
+)
+from .engine import (
+    AtomicActionEngine,
+    register_action,
+    unregister_action,
+    get_registered_actions,
+)
+from .primitives import (
+    CoordinatedPickment,
+    CoordinatedPickmentCfg,
+    CoordinatedPlacement,
+    CoordinatedPlacementCfg,
+    MoveEndEffector,
+    MoveEndEffectorCfg,
+    MoveHeldObject,
+    MoveHeldObjectCfg,
+    MoveJoints,
+    MoveJointsCfg,
+    PickUp,
+    PickUpCfg,
+    Place,
+    PlaceCfg,
+    Press,
+    PressCfg,
+)
+from .trajectory import TrajectoryBuilder
+
+__all__ = [
+    # Core classes
+    "Affordance",
+    "AntipodalAffordance",
+    "InteractionPoints",
+    "ObjectSemantics",
+    "HeldObjectState",
+    "CoordinatedHeldObjectState",
+    "HeldObjectPoseTarget",
+    "JointPositionTarget",
+    "NamedJointPositionTarget",
+    "EndEffectorPoseTarget",
+    "CoordinatedPickmentTarget",
+    "CoordinatedPlacementTarget",
+    "GraspTarget",
+    "Target",
+    "WorldState",
+    "ActionResult",
+    "ActionCfg",
+    "AtomicAction",
+    # Action implementations
+    "CoordinatedPickment",
+    "CoordinatedPlacement",
+    "MoveEndEffector",
+    "MoveJoints",
+    "MoveHeldObject",
+    "PickUp",
+    "Place",
+    "Press",
+    "CoordinatedPickmentCfg",
+    "CoordinatedPlacementCfg",
+    "MoveEndEffectorCfg",
+    "MoveJointsCfg",
+    "MoveHeldObjectCfg",
+    "PickUpCfg",
+    "PlaceCfg",
+    "PressCfg",
+    # Engine
+    "AtomicActionEngine",
+    "register_action",
+    "unregister_action",
+    "get_registered_actions",
+    # Trajectory helpers
+    "TrajectoryBuilder",
+]

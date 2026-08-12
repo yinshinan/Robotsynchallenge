@@ -1,0 +1,1148 @@
+# ----------------------------------------------------------------------------
+# Copyright (c) 2021-2026 DexForce Technology Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ----------------------------------------------------------------------------
+
+import numpy as np
+import torch
+import dexsim
+import argparse
+import gymnasium
+
+from typing import Dict, Any, List, Tuple, Union, Sequence
+from gymnasium import spaces
+from copy import deepcopy
+from tensordict import TensorDict
+
+from embodichain.lab.sim.types import Device, Array
+from embodichain.lab.sim.objects import Robot
+from embodichain.utils.module_utils import find_function_from_modules
+from embodichain.utils.utility import get_class_instance
+from dexsim.utility import log_debug, log_error
+
+# Default manager modules for config parsing
+DEFAULT_MANAGER_MODULES = [
+    "embodichain.lab.gym.envs.managers.actions",
+    "embodichain.lab.gym.envs.managers.datasets",
+    "embodichain.lab.gym.envs.managers.randomization",
+    "embodichain.lab.gym.envs.managers.record",
+    "embodichain.lab.gym.envs.managers.events",
+    "embodichain.lab.gym.envs.managers.observations",
+    "embodichain.lab.gym.envs.managers.rewards",
+]
+
+
+def get_dtype_bounds(dtype: np.dtype):
+    """Gets the min and max values of a given numpy type"""
+    if np.issubdtype(dtype, np.floating):
+        info = np.finfo(dtype)
+        return info.min, info.max
+    elif np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        return info.min, info.max
+    elif np.issubdtype(dtype, np.bool_):
+        return 0, 1
+    else:
+        raise TypeError(dtype)
+
+
+def convert_observation_to_space(
+    observation: Any, prefix: str = "", unbatched: bool = False
+) -> spaces.Space:
+    """Convert observation to OpenAI gym observation space (recursively).
+    Modified from `gym.envs.mujoco_env`
+    """
+    if isinstance(observation, (dict, TensorDict)):
+        # CATUION: Explicitly create a list of key-value tuples
+        # Otherwise, spaces.Dict will sort keys if a dict is provided
+        space = spaces.Dict(
+            [
+                (
+                    k,
+                    convert_observation_to_space(
+                        v, prefix + "/" + k, unbatched=unbatched
+                    ),
+                )
+                for k, v in observation.items()
+            ]
+        )
+    elif isinstance(observation, (list, tuple)):
+        array = np.array(observation)
+        dtype = array.dtype
+        space = spaces.Box(-np.inf, np.inf, shape=array.shape, dtype=dtype)
+    elif isinstance(observation, torch.Tensor):
+        if unbatched:
+            shape = observation.shape[1:]
+        else:
+            shape = observation.shape
+        dtype = observation.dtype
+        # Map torch dtype to numpy dtype and reuse get_dtype_bounds for consistency
+        torch_to_numpy_dtype = {
+            torch.float16: np.float16,
+            torch.float32: np.float32,
+            torch.float64: np.float64,
+            torch.int8: np.int8,
+            torch.uint8: np.uint8,
+            torch.int16: np.int16,
+            torch.uint16: np.uint16,
+            torch.int32: np.int32,
+            torch.int64: np.int64,
+            torch.bool: np.bool_,
+        }
+        np_dtype = torch_to_numpy_dtype.get(dtype, np.float32)
+        low, high = get_dtype_bounds(np_dtype)
+        if np.issubdtype(np_dtype, np.floating):
+            low, high = -np.inf, np.inf
+        space = spaces.Box(low, high, shape=shape, dtype=np_dtype)
+    elif isinstance(observation, np.ndarray):
+        if unbatched:
+            shape = observation.shape[1:]
+        else:
+            shape = observation.shape
+        dtype = observation.dtype
+        low, high = get_dtype_bounds(dtype)
+        if np.issubdtype(dtype, np.floating):
+            low, high = -np.inf, np.inf
+        space = spaces.Box(low, high, shape=shape, dtype=dtype)
+    elif isinstance(observation, (float, np.float32, np.float64)):
+        log_debug(f"The observation ({prefix}) is a (float) scalar")
+        space = spaces.Box(-np.inf, np.inf, shape=[1], dtype=np.float32)
+    elif isinstance(observation, (int, np.int32, np.int64)):
+        log_debug(f"The observation ({prefix}) is a (integer) scalar")
+        space = spaces.Box(-np.inf, np.inf, shape=[1], dtype=int)
+    elif isinstance(observation, (bool, np.bool_)):
+        log_debug(f"The observation ({prefix}) is a (bool) scalar")
+        space = spaces.Box(0, 1, shape=[1], dtype=np.bool_)
+    else:
+        raise NotImplementedError(type(observation), observation)
+
+    return space
+
+
+def _batch(array: Union[np.ndarray, Sequence]):
+    if isinstance(array, (dict)):
+        return {k: _batch(v) for k, v in array.items()}
+    if isinstance(array, str):
+        return array
+    if isinstance(array, np.ndarray):
+        if array.shape == ():
+            return array.reshape(1, 1)
+        return array[None, :]
+    if isinstance(array, list):
+        if len(array) == 1:
+            return [array]
+    if (
+        isinstance(array, float)
+        or isinstance(array, int)
+        or isinstance(array, bool)
+        or isinstance(array, np.bool_)
+    ):
+        return np.array([[array]])
+    return array
+
+
+def batch(*args: Tuple[Union[np.ndarray, Dict]]):
+    """Adds one dimension in front of everything. If given a dictionary, every leaf in the dictionary
+    has a new dimension. If given a tuple, returns the same tuple with each element batched
+    """
+    x = [_batch(x) for x in args]
+    if len(args) == 1:
+        return x[0]
+    return tuple(x)
+
+
+def to_tensor(array: Array, device: Device | None = None):
+    """
+    Maps any given sequence to a torch tensor on the CPU/GPU. If physics gpu is not enabled then we use CPU, otherwise GPU, unless specified
+    by the device argument
+
+    Args:
+        array: The data to map to a tensor
+        device: The device to put the tensor on. By default this is None and to_tensor will put the device on the GPU if physics is enabled
+            and CPU otherwise
+
+    """
+    if isinstance(array, (dict)):
+        return {k: to_tensor(v) for k, v in array.items()}
+    if torch.cuda.is_available():
+        if isinstance(array, np.ndarray):
+            if array.dtype == np.uint16:
+                array = array.astype(np.int32)
+            ret = torch.from_numpy(array)
+            if ret.dtype == torch.float64:
+                ret = ret.float()
+        elif isinstance(array, torch.Tensor):
+            ret = array
+        else:
+            ret = torch.tensor(array)
+        if device is None:
+            if ret.device.type == "cpu":
+                return ret.cuda()
+            # keep same device if already on GPU
+            return ret
+        else:
+            return ret.to(device)
+    else:
+        if isinstance(array, np.ndarray):
+            if array.dtype == np.uint16:
+                array = array.astype(np.int32)
+            if array.dtype == np.uint32:
+                array = array.astype(np.int64)
+            ret = torch.from_numpy(array)
+            if ret.dtype == torch.float64:
+                ret = ret.float()
+        elif isinstance(array, list) and isinstance(array[0], np.ndarray):
+            ret = torch.from_numpy(np.array(array))
+            if ret.dtype == torch.float64:
+                ret = ret.float()
+        elif np.iterable(array):
+            ret = torch.Tensor(array)
+        else:
+            ret = torch.Tensor(array)
+        if device is None:
+            return ret
+        else:
+            return ret.to(device)
+
+
+def to_cpu_tensor(array: Array):
+    """
+    Maps any given sequence to a torch tensor on the CPU.
+    """
+    if isinstance(array, (dict)):
+        return {k: to_tensor(v) for k, v in array.items()}
+    if isinstance(array, np.ndarray):
+        ret = torch.from_numpy(array)
+        if ret.dtype == torch.float64:
+            ret = ret.float()
+        return ret
+    elif isinstance(array, torch.Tensor):
+        return array.cpu()
+    else:
+        return torch.tensor(array).cpu()
+
+
+def flatten_state_dict(
+    state_dict: dict, use_torch=False, device: Device = None
+) -> Array:
+    """Flatten a dictionary containing states recursively. Expects all data to be either torch or numpy
+
+    Args:
+        state_dict: a dictionary containing scalars or 1-dim vectors.
+        use_torch (bool): Whether to convert the data to torch tensors.
+
+    Raises:
+        AssertionError: If a value of @state_dict is an ndarray with ndim > 2.
+
+    Returns:
+        np.ndarray | torch.Tensor: flattened states.
+
+    Notes:
+        The input is recommended to be ordered (e.g. dict).
+        However, since python 3.7, dictionary order is guaranteed to be insertion order.
+    """
+    states = []
+
+    for key, value in state_dict.items():
+        if isinstance(value, dict):
+            state = flatten_state_dict(value, use_torch=use_torch)
+            if state.size == 0:
+                state = None
+            if use_torch:
+                state = to_tensor(state)
+        elif isinstance(value, (tuple, list)):
+            state = None if len(value) == 0 else value
+            if use_torch:
+                state = to_tensor(state)
+        elif isinstance(value, (bool, np.bool_, int, np.int32, np.int64)):
+            # x = np.array(1) > 0 is np.bool_ instead of ndarray
+            state = int(value)
+            if use_torch:
+                state = to_tensor(state)
+        elif isinstance(value, (float, np.float32, np.float64)):
+            state = np.float32(value)
+            if use_torch:
+                state = to_tensor(state)
+        elif isinstance(value, np.ndarray):
+            if value.ndim > 2:
+                raise AssertionError(
+                    "The dimension of {} should not be more than 2.".format(key)
+                )
+            state = value if value.size > 0 else None
+            if use_torch:
+                state = to_tensor(state)
+
+        elif isinstance(value, torch.Tensor):
+            state = value
+            if len(state.shape) == 1:
+                state = state[:, None]
+        else:
+            raise TypeError("Unsupported type: {}".format(type(value)))
+        if state is not None:
+            states.append(state)
+
+    if use_torch:
+        if len(states) == 0:
+            return torch.empty(0, device=device)
+        else:
+            return torch.hstack(states)
+    else:
+        if len(states) == 0:
+            return np.empty(0)
+        else:
+            return np.hstack(states)
+
+
+def clip_and_scale_action(
+    action: Union[np.ndarray, torch.Tensor], low: float, high: float
+):
+    """Clip action to [-1, 1] and scale according to a range [low, high]."""
+    if isinstance(action, np.ndarray):
+        action = np.clip(action, -1, 1)
+    elif isinstance(action, torch.Tensor):
+        action = torch.clip(action, -1, 1)
+    else:
+        log_error("Unsupported type: {}".format(type(action)))
+    return 0.5 * (high + low) + 0.5 * (high - low) * action
+
+
+def dict_array_to_torch_inplace(
+    data: Dict[str, Any], device: Union[str, torch.device] = "cpu"
+) -> None:
+    """
+    Convert arrays in a dictionary to torch tensors in-place.
+
+    Args:
+        data (Dict[str, Any]): Dictionary to modify in-place
+        device (Union[str, torch.device]): Device to place the tensors on
+    """
+    for key, value in data.items():
+        if isinstance(value, np.ndarray):
+            item: torch.Tensor = torch.from_numpy(value).to(device)
+            if len(item.shape) == 1:
+                item.unsqueeze_(0)
+            data[key] = item
+        elif isinstance(value, dict):
+            dict_array_to_torch_inplace(value, device)
+
+
+def cat_tensor_with_ids(
+    tensors: List[torch.Tensor], ids: List[List[int]], dim: int
+) -> torch.Tensor:
+    """
+    Concatenate tensors along a new dimension specified by `dim`, using the provided `ids` to index into the tensors.
+
+    Args:
+        tensors (List[torch.Tensor]): List of tensors to concatenate.
+        ids (List[List[int]]): List of lists, where each inner list contains the indices to select from the corresponding tensor.
+        dim (int): The dimension along which to concatenate the tensors.
+
+    Returns:
+        torch.Tensor: The concatenated tensor.
+    """
+    out = torch.zeros(
+        (tensors[0].shape[0], dim), dtype=tensors[0].dtype, device=tensors[0].device
+    )
+
+    for i, tensor in enumerate(tensors):
+        out[:, ids[i]] = tensor
+
+    return out
+
+
+def config_to_cfg(config: dict, manager_modules: list = None) -> "EmbodiedEnvCfg":
+    """Parser configuration file into cfgs for env initialization.
+
+    Args:
+        config (dict): The configuration dictionary containing robot, sensor, light, background, and interactive objects.
+        manager_modules (list): List of module paths for dataset, event, observation, and reward managers.
+            If not provided, uses default module paths.
+
+    Returns:
+        EmbodiedEnvCfg: A configuration object for initializing the environment.
+    """
+
+    from embodichain.lab.sim.cfg import (
+        RobotCfg,
+        RigidObjectCfg,
+        RigidObjectGroupCfg,
+        ArticulationCfg,
+        LightCfg,
+    )
+    from embodichain.lab.sim.sensors import SensorCfg
+    from embodichain.lab.gym.envs import EmbodiedEnvCfg
+    from embodichain.lab.gym.envs.managers import (
+        SceneEntityCfg,
+        EventCfg,
+        ObservationCfg,
+        RewardCfg,
+        ActionTermCfg,
+        DatasetFunctorCfg,
+    )
+    from embodichain.utils import configclass
+    from embodichain.data import get_data_path
+
+    @configclass
+    class ComponentCfg:
+        """Configuration for env events.
+
+        This class is used to define various events that can occur in the environment,
+        """
+
+        pass
+
+    env_cfg = EmbodiedEnvCfg()
+
+    # check all necessary keys
+    required_keys = ["id", "env", "robot"]
+    for key in required_keys:
+        if key not in config:
+            log_error(f"Missing required config key: {key}")
+
+    env_cfg.max_episode_steps = config.get("max_episode_steps", 300)
+    env_cfg.num_envs = config.get("num_envs", 1)
+
+    # parser robot config
+    # TODO: support multiple robots cfg initialization from config, eg, cobotmagic, dexforce_w1, etc.
+    if "robot_type" in config["robot"]:
+        robot_cfg = get_class_instance(
+            "embodichain.lab.sim.robots",
+            config["robot"]["robot_type"] + "Cfg",
+        )
+        config["robot"].pop("robot_type")
+        robot_cfg = robot_cfg.from_dict(config["robot"])
+    else:
+        robot_cfg = RobotCfg.from_dict(config["robot"])
+
+    env_cfg.robot = robot_cfg
+
+    # parser sensor config
+    env_cfg.sensor = [SensorCfg.from_dict(s) for s in config.get("sensor", [])]
+
+    # parser light config
+    if "light" in config:
+        env_cfg.light = EmbodiedEnvCfg.EnvLightCfg()
+        env_cfg.light.direct = [
+            LightCfg.from_dict(l) for l in config["light"].get("direct", [])
+        ]
+        env_cfg.light.indirect = config["light"].get("indirect", None)
+
+    # parser background objects config
+    if "background" in config:
+        for obj_dict in config["background"]:
+            shape_type = obj_dict["shape"]["shape_type"]
+            if shape_type == "Mesh":
+                obj_dict["shape"]["fpath"] = get_data_path(obj_dict["shape"]["fpath"])
+            # Set to static object if not specified.
+            obj_dict["body_type"] = (
+                "static" if "body_type" not in obj_dict else obj_dict["body_type"]
+            )
+            cfg = RigidObjectCfg.from_dict(obj_dict)
+            env_cfg.background.append(cfg)
+
+    # parser scene objects config
+    if "rigid_object" in config:
+        for obj_dict in config["rigid_object"]:
+            shape_type = obj_dict["shape"]["shape_type"]
+            if shape_type == "Mesh":
+                obj_dict["shape"]["fpath"] = get_data_path(obj_dict["shape"]["fpath"])
+            cfg = RigidObjectCfg.from_dict(obj_dict)
+            env_cfg.rigid_object.append(cfg)
+
+    if "rigid_object_group" in config:
+        for obj_dict in config["rigid_object_group"]:
+            if "folder_path" in obj_dict:
+                obj_dict["folder_path"] = get_data_path(obj_dict["folder_path"])
+            for rigid_obj in obj_dict["rigid_objects"].values():
+                shape_type = rigid_obj["shape"]["shape_type"]
+                if shape_type == "Mesh" and "fpath" in rigid_obj["shape"]:
+                    rigid_obj["shape"]["fpath"] = get_data_path(
+                        rigid_obj["shape"]["fpath"]
+                    )
+            cfg = RigidObjectGroupCfg.from_dict(obj_dict)
+            env_cfg.rigid_object_group.append(cfg)
+
+    if "articulation" in config:
+        for obj_dict in config["articulation"]:
+            obj_dict["fpath"] = get_data_path(obj_dict["fpath"])
+            cfg = ArticulationCfg.from_dict(obj_dict)
+            env_cfg.articulation.append(cfg)
+
+    env_cfg.control_parts = config["env"].get("control_parts", None)
+    env_cfg.sim_steps_per_control = config["env"].get("sim_steps_per_control", 4)
+    env_cfg.extensions = deepcopy(config.get("env", {}).get("extensions", {}))
+
+    # Initialize manager_modules with defaults
+    default_manager_modules = DEFAULT_MANAGER_MODULES.copy()
+
+    # Extend with user-provided modules, skipping duplicates
+    if manager_modules is not None:
+        for module in manager_modules:
+            if module not in default_manager_modules:
+                default_manager_modules.append(module)
+
+    manager_modules = default_manager_modules
+
+    env_cfg.dataset = ComponentCfg()
+    if "dataset" in config["env"]:
+        for dataset_name, dataset_params in config["env"]["dataset"].items():
+            dataset_params_modified = deepcopy(dataset_params)
+
+            # Check if this is a functor configuration (has "func" field) or a plain config
+            if "func" in dataset_params:
+                # Find the function from multiple modules using the utility function
+                dataset_func = find_function_from_modules(
+                    dataset_params["func"],
+                    manager_modules,
+                    raise_if_not_found=True,
+                )
+
+                from embodichain.lab.gym.envs.managers import DatasetFunctorCfg
+
+                dataset = DatasetFunctorCfg(
+                    func=dataset_func,
+                    mode=dataset_params_modified["mode"],
+                    params=dataset_params_modified["params"],
+                )
+
+                setattr(env_cfg.dataset, dataset_name, dataset)
+            else:
+                # Plain configuration (e.g., robot_meta), set directly
+                setattr(env_cfg.dataset, dataset_name, dataset_params_modified)
+
+    env_cfg.events = ComponentCfg()
+    if "events" in config["env"]:
+        # parser env events config
+        for event_name, event_params in config["env"]["events"].items():
+            event_params_modified = deepcopy(event_params)
+            if "entity_cfg" in event_params["params"]:
+                entity_cfg = SceneEntityCfg(
+                    **event_params_modified["params"]["entity_cfg"]
+                )
+                event_params_modified["params"]["entity_cfg"] = entity_cfg
+            if "entity_cfgs" in event_params["params"]:
+                entity_cfgs = [
+                    SceneEntityCfg(**cfg)
+                    for cfg in event_params_modified["params"]["entity_cfgs"]
+                ]
+                event_params_modified["params"]["entity_cfgs"] = entity_cfgs
+
+            # Find the function from multiple modules using the utility function
+            event_func = find_function_from_modules(
+                event_params["func"], manager_modules, raise_if_not_found=True
+            )
+            interval_step = event_params_modified.get("interval_step", 10)
+
+            event = EventCfg(
+                func=event_func,
+                mode=event_params_modified["mode"],
+                params=event_params_modified["params"],
+                interval_step=interval_step,
+            )
+            setattr(env_cfg.events, event_name, event)
+
+    env_cfg.observations = ComponentCfg()
+    if "observations" in config["env"]:
+        for obs_name, obs_params in config["env"]["observations"].items():
+            obs_params_modified = deepcopy(obs_params)
+
+            if "entity_cfg" in obs_params["params"]:
+                entity_cfg = SceneEntityCfg(
+                    **obs_params_modified["params"]["entity_cfg"]
+                )
+                obs_params_modified["params"]["entity_cfg"] = entity_cfg
+
+            # Find the function from multiple modules using the utility function
+            obs_func = find_function_from_modules(
+                obs_params["func"],
+                manager_modules,
+                raise_if_not_found=True,
+            )
+
+            observation = ObservationCfg(
+                func=obs_func,
+                mode=obs_params_modified["mode"],
+                name=obs_params_modified["name"],
+                params=obs_params_modified["params"],
+            )
+
+            setattr(env_cfg.observations, obs_name, observation)
+
+    env_cfg.rewards = ComponentCfg()
+    if "rewards" in config["env"]:
+        for reward_name, reward_params in config["env"]["rewards"].items():
+            reward_params_modified = deepcopy(reward_params)
+
+            # Handle entity_cfg parameters
+            for param_key in [
+                "entity_cfg",
+                "source_entity_cfg",
+                "target_entity_cfg",
+                "end_effector_cfg",
+                "object_cfg",
+                "goal_cfg",
+                "reference_entity_cfg",
+            ]:
+                if param_key in reward_params["params"]:
+                    entity_cfg = SceneEntityCfg(
+                        **reward_params_modified["params"][param_key]
+                    )
+                    reward_params_modified["params"][param_key] = entity_cfg
+
+            # Find the function from multiple modules using the utility function
+            reward_func = find_function_from_modules(
+                reward_params["func"],
+                manager_modules,
+                raise_if_not_found=True,
+            )
+
+            reward = RewardCfg(
+                func=reward_func,
+                mode=reward_params_modified["mode"],
+                params=reward_params_modified["params"],
+            )
+
+            setattr(env_cfg.rewards, reward_name, reward)
+
+    # parse actions config (ActionManager)
+    env_cfg.actions = None
+    env_config = config["env"]
+    if "actions" in env_config:
+        env_cfg.actions = ComponentCfg()
+        for term_name, term_params in env_config["actions"].items():
+            term_params_modified = deepcopy(term_params)
+            term_func = find_function_from_modules(
+                term_params["func"],
+                manager_modules,
+                raise_if_not_found=True,
+            )
+            action_term = ActionTermCfg(
+                func=term_func,
+                params=term_params_modified.get("params", {}),
+            )
+            setattr(env_cfg.actions, term_name, action_term)
+
+    return env_cfg
+
+
+def map_qpos_to_eef_pose(
+    robot: Robot, qpos: torch.Tensor, control_parts: List[str]
+) -> Dict[str, torch.Tensor]:
+    """Map qpos to end-effector pose.
+
+    Note:
+        The computed eef pose will be in the base frame of the control part.
+
+    Args:
+        robot (Robot): The robot instance.
+        qpos (torch.Tensor): The qpos tensor of shape (N, num_joints).
+        control_parts (List[str]): List of control part names.
+        to_dict (bool): Whether to return the result as a dictionary.
+
+    Returns:
+        Dict[str, torch.Tensor]: A dictionary containing the end-effector poses for each control part.
+    """
+
+    eef_pose_dict = {}
+    for i, name in enumerate(control_parts):
+        eef_pose = torch.zeros(
+            (qpos.shape[0], 9), dtype=torch.float32, device=qpos.device
+        )
+
+        # TODO: need to be configurable.
+        control_ids = robot.get_joint_ids(name)
+        current_qpos = qpos[:, control_ids]
+        part_eef_pose = (
+            robot.pk_serial_chain[name]
+            .forward_kinematics(current_qpos, end_only=True)
+            .get_matrix()
+        )
+
+        eef_pose[:, :3] = part_eef_pose[:, :3, 3]
+        eef_pose[:, 3:6] = part_eef_pose[:, :3, 0]
+        eef_pose[:, 6:9] = part_eef_pose[:, :3, 1]
+
+        eef_pose_dict[name] = eef_pose
+
+    return eef_pose_dict
+
+
+def fetch_data_from_dict(
+    data_dict: Dict[str, Union[Any, Dict[str, Any]]], name: str
+) -> Any:
+    """Fetch data from a nested dictionary using a '/' separated key.
+
+    Args:
+        data_dict (Dict[str, Union[Any, Dict[str, Any]]]): The nested dictionary to fetch data from.
+        name (str): The '/' separated key string.
+
+    Returns:
+        Any: The fetched data.
+
+    Raises:
+        KeyError: If the specified key does not exist in the dictionary.
+    """
+    keys = name.split("/")
+    current_data = data_dict
+
+    for key in keys:
+        if key in current_data:
+            current_data = current_data[key]
+        else:
+            raise KeyError(f"Key '{key}' not found in the dictionary.")
+
+    return current_data
+
+
+def assign_data_to_dict(data_dict: TensorDict, name: str, value: Any) -> None:
+    """Assign data to a TensorDict using a '/' separated key.
+    Missing intermediate TensorDicts will be created automatically.
+
+    Args:
+        data_dict (TensorDict): The TensorDict to assign data to.
+        name (str): The '/' separated key string.
+        value (Any): The value to assign.
+    """
+    keys = name.split("/")
+    current_data = data_dict
+    batch_size = current_data.batch_size
+
+    for key in keys[:-1]:
+        if key not in current_data or not isinstance(current_data.get(key), TensorDict):
+            current_data[key] = TensorDict(
+                {}, batch_size=current_data.batch_size, device=current_data.device
+            )
+        current_data = current_data[key]
+
+    last_key = keys[-1]
+    current_data.batch_size = batch_size  # Ensure the batch size is consistent
+    current_data[last_key] = value
+
+
+def add_env_launcher_args_to_parser(parser: argparse.ArgumentParser) -> None:
+    """Add common environment launcher arguments to an existing argparse parser.
+
+    This function adds the following arguments to the provided parser:
+        --num_envs: Number of environments to run in parallel (default: 1)
+        --device: Device to run the environment on (default: 'cpu')
+        --headless: Whether to perform the simulation in headless mode (default: False)
+        --renderer: Renderer backend to use for the simulation. Options are 'hybrid', 'fast-rt', and 'rt'. (default: 'hybrid')
+        --gpu_id: The GPU ID to use for the simulation (default: 0)
+        --gym_config: Path to gym config file (default: '')
+        --action_config: Path to action config file (default: None)
+        --preview: Whether to preview the environment after launching (default: False)
+        --filter_visual_rand: Whether to filter out visual randomization (default: False)
+        --filter_dataset_saving: Whether to filter out dataset saving (default: False)
+
+    Note:
+        1. In preview mode, the environment will be launched and keep running in a loop for user interaction.
+
+    Args:
+        parser (argparse.ArgumentParser): The parser to which arguments will be added.
+    """
+    parser.add_argument(
+        "--num_envs",
+        help="The number of environments to run in parallel.",
+        default=1,
+        type=int,
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help="Device to run the environment on, e.g., 'cpu' or 'cuda'.",
+    )
+    parser.add_argument(
+        "--headless",
+        help="Whether to perform the simulation in headless mode.",
+        default=False,
+        action="store_true",
+    )
+    parser.add_argument(
+        "--renderer",
+        type=str,
+        choices=["auto", "hybrid", "fast-rt", "rt"],
+        default="auto",
+        help="Renderer backend to use for the simulation.",
+    )
+    parser.add_argument(
+        "--arena_space",
+        help="The size of the arena space.",
+        default=5.0,
+        type=float,
+    )
+    parser.add_argument(
+        "--gpu_id",
+        help="The GPU ID to use for the simulation.",
+        default=0,
+        type=int,
+    )
+    parser.add_argument(
+        "--gym_config",
+        type=str,
+        help="Path to gym config file (.json, .yaml, or .yml).",
+        default="",
+        required=False,
+    )
+    parser.add_argument(
+        "--action_config",
+        type=str,
+        help="Path to action config file (.json, .yaml, or .yml).",
+        default=None,
+    )
+    parser.add_argument(
+        "--preview",
+        help="Whether to preview the environment after launching.",
+        default=False,
+        action="store_true",
+    )
+    parser.add_argument(
+        "--filter_visual_rand",
+        help="Whether to filter out visual randomization.",
+        default=False,
+        action="store_true",
+    )
+    parser.add_argument(
+        "--filter_dataset_saving",
+        help="Whether to filter out dataset saving.",
+        default=False,
+        action="store_true",
+    )
+    parser.add_argument(
+        "--max_episodes",
+        help="Override the max_episodes value from the gym config.",
+        default=None,
+        type=int,
+    )
+
+
+def merge_args_with_gym_config(args: argparse.Namespace, gym_config: dict) -> dict:
+    """Merge command-line arguments with gym configuration.
+
+    Command-line arguments will override the corresponding values in the gym configuration.
+
+    Args:
+        args (argparse.Namespace): The parsed command-line arguments.
+        gym_config (dict): The original gym configuration dictionary.
+
+    Returns:
+        dict: The merged gym configuration dictionary.
+    """
+    merged_config = deepcopy(gym_config)
+    merged_config["num_envs"] = args.num_envs
+    merged_config["device"] = args.device
+    merged_config["headless"] = args.headless
+    merged_config["renderer"] = args.renderer
+    merged_config["gpu_id"] = args.gpu_id
+    merged_config["arena_space"] = args.arena_space
+    if args.max_episodes is not None:
+        merged_config["max_episodes"] = args.max_episodes
+    return merged_config
+
+
+def build_env_cfg_from_args(
+    args: argparse.Namespace,
+) -> tuple["EmbodiedEnvCfg", dict, dict]:
+    """Build environment configuration from command-line arguments.
+
+    Args:
+        args (argparse.Namespace): The parsed command-line arguments.
+
+    Returns:
+        tuple[EmbodiedEnvCfg, dict, dict]: A tuple containing the environment configuration object,
+            the original gym configuration dictionary, and the action configuration dictionary.
+    """
+    from embodichain.utils.utility import load_config
+    from embodichain.lab.gym.envs import EmbodiedEnvCfg
+    from embodichain.lab.sim import SimulationManagerCfg
+    from embodichain.lab.sim.cfg import RenderCfg
+
+    gym_config = load_config(args.gym_config)
+    gym_config = merge_args_with_gym_config(args, gym_config)
+
+    cfg: EmbodiedEnvCfg = config_to_cfg(
+        gym_config, manager_modules=DEFAULT_MANAGER_MODULES
+    )
+    cfg.filter_visual_rand = args.filter_visual_rand
+    cfg.filter_dataset_saving = args.filter_dataset_saving
+
+    if args.preview:
+        # In preview mode, we typically don't want to save data
+        cfg.filter_dataset_saving = True
+
+    action_config = {}
+    if args.action_config is not None:
+        action_config = load_config(args.action_config)
+        action_config["action_config"] = action_config
+
+    cfg.sim_cfg = SimulationManagerCfg(
+        headless=gym_config["headless"],
+        sim_device=gym_config["device"],
+        render_cfg=RenderCfg(renderer=gym_config["renderer"]),
+        gpu_id=gym_config["gpu_id"],
+        arena_space=gym_config["arena_space"],
+    )
+
+    return cfg, gym_config, action_config
+
+
+def init_rollout_buffer_from_gym_space(
+    obs_space: spaces.Space,
+    action_space: spaces.Space,
+    max_episode_steps: int,
+    num_envs: int,
+    device: Union[str, torch.device] = "cpu",
+) -> TensorDict:
+    """Initialize a rollout buffer based on the observation and action spaces.
+
+    Args:
+        obs_space (spaces.Space): The observation space of the environment.
+        action_space (spaces.Space): The action space of the environment.
+        max_episode_steps (int): The number of steps in an episode.
+        num_envs (int): The number of parallel environments.
+
+    Returns:
+        TensorDict: A TensorDict containing the initialized rollout buffer with keys 'obs', 'actions' and 'rewards'.
+    """
+
+    def _convert_space_dtype_to_torch_dtype(space: spaces.Space) -> torch.dtype:
+        if isinstance(space, spaces.Dict):
+            return {k: _convert_space_dtype_to_torch_dtype(v) for k, v in space.items()}
+        elif isinstance(space, spaces.Box):
+            if np.issubdtype(space.dtype, np.floating):
+                return torch.float32
+            elif np.issubdtype(space.dtype, np.int64):
+                return torch.int64
+            elif np.issubdtype(space.dtype, np.int32):
+                return torch.int32
+            elif np.issubdtype(space.dtype, np.uint16):
+                return torch.uint16
+            elif np.issubdtype(space.dtype, np.uint8):
+                return torch.uint8
+            elif np.issubdtype(space.dtype, np.bool_):
+                return torch.bool
+            else:
+                log_error(f"Unsupported space dtype: {space.dtype}")
+        else:
+            log_error(f"Space type {type(space)} is not supported yet.")
+
+    def _init_buffer_from_space(
+        space: spaces.Space, num_envs: int
+    ) -> Union[torch.Tensor, TensorDict]:
+        if isinstance(space, spaces.Dict):
+            return TensorDict(
+                {k: _init_buffer_from_space(v, num_envs) for k, v in space.items()},
+                batch_size=[num_envs],
+                device=device,
+            )
+        elif isinstance(space, spaces.Box):
+            return torch.zeros(
+                (num_envs, max_episode_steps, *space.shape[1:]),
+                dtype=_convert_space_dtype_to_torch_dtype(space),
+                device=device,
+            )
+        else:
+            log_error(f"Space type {type(space)} is not supported yet.")
+
+    rollout_buffer = TensorDict(
+        {
+            "obs": _init_buffer_from_space(obs_space, num_envs),
+            "actions": _init_buffer_from_space(action_space, num_envs),
+            "rewards": torch.zeros(
+                (num_envs, max_episode_steps), dtype=torch.float32, device=device
+            ),
+        },
+        batch_size=[num_envs, max_episode_steps],
+        device=device,
+    )
+    return rollout_buffer
+
+
+def init_rollout_buffer_from_config(
+    config: dict,
+    max_episode_steps: int,
+    batch_size: int,
+    state_dim: int,
+    device: Union[str, torch.device] = "cpu",
+) -> TensorDict:
+    """Initialize a rollout buffer based on the environment configuration.
+
+    The function creates a rollout buffer containing:
+        - Basic observations: ``robot/qpos``, ``robot/qvel``, ``robot/qf``
+        - Sensor observations: ``sensor/<uid>`` for each sensor in config
+        - Extra observations: Custom observations from observation functors in ``add`` mode
+            that have a ``shape`` specified in their ``extra`` parameter
+
+    Args:
+        config (dict): The environment configuration dictionary.
+        max_episode_steps (int): The number of steps in an episode.
+        batch_size (int): The batch size for the rollout buffer.
+        state_dim (int): The dimension of the flattened state vector.
+
+    Returns:
+        TensorDict: A TensorDict containing the initialized rollout buffer with keys 'obs', 'actions' and 'rewards'.
+    """
+
+    # TODO: Currently we use this method to pre-allocate a rollout buffer with fixed size for simplicity.
+    # Parse extra observations from observation functors in 'add' mode
+    extra_obs_desc = {}
+    env_config = config.get("env", {})
+    if "observations" in env_config:
+        for obs_name, obs_params in env_config["observations"].items():
+            obs_mode = obs_params.get("mode", "modify")
+            if obs_mode == "add":
+                obs_extra = obs_params.get("extra", {})
+                shape = obs_extra.get("shape", None)
+                if shape is not None:
+                    # Ensure shape is a tuple
+                    if isinstance(shape, list):
+                        shape = tuple(shape)
+
+                    key = obs_params.get(
+                        "name", obs_name
+                    )  # Use 'name' if provided, otherwise use obs_name
+
+                    # Create buffer with shape (batch_size, max_episode_steps, *shape)
+                    extra_obs_desc[key] = torch.zeros(
+                        (batch_size, max_episode_steps, *shape),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+
+    # Parse sensor
+    sensor_desc = {}
+    for cfg in config.get("sensor", []):
+        desc = {}
+        width = cfg.get("width", 640)
+        height = cfg.get("height", 480)
+        desc["color"] = torch.zeros(
+            (
+                batch_size,
+                max_episode_steps,
+                height,
+                width,
+                4,
+            ),
+            dtype=torch.uint8,
+            device=device,
+        )
+        if cfg.get("enable_mask", False):
+            desc["mask"] = torch.zeros(
+                (
+                    batch_size,
+                    max_episode_steps,
+                    height,
+                    width,
+                ),
+                dtype=torch.int32,
+                device=device,
+            )
+        if cfg.get("enable_depth", False):
+            desc["depth"] = torch.zeros(
+                (
+                    batch_size,
+                    max_episode_steps,
+                    height,
+                    width,
+                ),
+                dtype=torch.float32,
+                device=device,
+            )
+
+        if cfg.get("sensor_type", "Camera") == "StereoCamera":
+            desc["color_right"] = torch.zeros(
+                (
+                    batch_size,
+                    max_episode_steps,
+                    height,
+                    width,
+                    4,
+                ),
+                dtype=torch.uint8,
+                device=device,
+            )
+            if "mask" in desc:
+                desc["mask_right"] = torch.zeros(
+                    (
+                        batch_size,
+                        max_episode_steps,
+                        height,
+                        width,
+                    ),
+                    dtype=torch.int32,
+                    device=device,
+                )
+            if "depth" in desc:
+                desc["depth_right"] = torch.zeros(
+                    (
+                        batch_size,
+                        max_episode_steps,
+                        height,
+                        width,
+                    ),
+                    dtype=torch.float32,
+                    device=device,
+                )
+
+        sensor_desc[cfg.get("uid", "camera")] = desc
+
+    # For simplicity, we initialize the observation buffer as a flat vector with dimension state_dim.
+    # In practice, you may want to initialize it according to the actual observation space structure.
+    rollout_buffer = TensorDict(
+        {
+            "obs": {
+                "robot": {
+                    "qpos": torch.zeros(
+                        (batch_size, max_episode_steps, state_dim),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                    "qvel": torch.zeros(
+                        (batch_size, max_episode_steps, state_dim),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                    "qf": torch.zeros(
+                        (batch_size, max_episode_steps, state_dim),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                },
+            },
+            # TODO: For action, we may support TensorDict structure in the future, which may include
+            # qpos, qvel and qf.
+            "actions": torch.zeros(
+                (batch_size, max_episode_steps, state_dim),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "rewards": torch.zeros(
+                (batch_size, max_episode_steps), dtype=torch.float32, device=device
+            ),
+        },
+        batch_size=[batch_size, max_episode_steps],
+        device=device,
+    )
+
+    if sensor_desc:
+        rollout_buffer["obs"]["sensor"] = TensorDict(
+            sensor_desc, batch_size=[batch_size, max_episode_steps], device=device
+        )
+
+    # Add extra observations from functors in 'add' mode
+    if extra_obs_desc:
+        for obs_name, obs_tensor in extra_obs_desc.items():
+            assign_data_to_dict(rollout_buffer["obs"], obs_name, obs_tensor)
+
+    return rollout_buffer

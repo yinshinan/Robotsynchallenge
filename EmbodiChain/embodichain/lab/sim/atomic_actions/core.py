@@ -1,0 +1,367 @@
+# ----------------------------------------------------------------------------
+# Copyright (c) 2021-2026 DexForce Technology Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ----------------------------------------------------------------------------
+
+from __future__ import annotations
+
+import torch
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, ClassVar, Literal, TYPE_CHECKING
+
+from embodichain.lab.sim.common import BatchEntity
+from embodichain.utils import configclass
+
+from .affordance import Affordance
+
+if TYPE_CHECKING:
+    from embodichain.lab.sim.planners import MotionGenerator
+
+
+# =============================================================================
+# ObjectSemantics
+# =============================================================================
+
+
+@dataclass
+class ObjectSemantics:
+    """Semantic information about an interaction target."""
+
+    affordance: Affordance
+    """Affordance data describing how the object can be interacted with."""
+
+    geometry: dict[str, Any]
+    """Non-affordance geometric metadata (e.g., bounding_box). Mesh tensors live
+    on AntipodalAffordance, not here."""
+
+    properties: dict[str, Any] = field(default_factory=dict)
+    """Physical properties: mass, friction, etc."""
+
+    label: str = "none"
+    """Object category label (e.g., 'mug', 'apple')."""
+
+    entity: BatchEntity | None = None
+    """Optional reference to the simulation entity for this object."""
+
+    def __post_init__(self) -> None:
+        # Bind only the label onto the affordance for convenience. DO NOT
+        # alias the geometry dict — that was the footgun fixed by this redesign.
+        self.affordance.object_label = self.label
+
+
+# =============================================================================
+# Typed targets
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class EndEffectorPoseTarget:
+    """End-effector pose target. Used by MoveEndEffector, Place, and Press."""
+
+    xpos: torch.Tensor
+    """Target end-effector homogeneous transform.
+
+    Accepts:
+
+    - ``(4, 4)`` or ``(n_envs, 4, 4)`` — a single waypoint.
+    - ``(n_envs, n_waypoint, 4, 4)`` — a multi-waypoint trajectory; waypoints
+      are visited in order. (Consumed as multi-waypoint by MoveEndEffector and
+      Place.)
+    """
+
+    tcp_symmetry: Literal["none", "z_roll_180"] = "none"
+    """Optional TCP-frame symmetry allowed by the target semantics.
+
+    ``"none"`` preserves the pose exactly. ``"z_roll_180"`` lets supporting
+    actions choose between the pose and its TCP z-roll 180 equivalent, which
+    flips TCP x/y while preserving TCP z and translation.
+    """
+
+    def __post_init__(self) -> None:
+        if self.tcp_symmetry not in ("none", "z_roll_180"):
+            raise ValueError(
+                "tcp_symmetry must be one of 'none' or 'z_roll_180', "
+                f"but got {self.tcp_symmetry!r}"
+            )
+
+
+@dataclass(frozen=True)
+class JointPositionTarget:
+    """Joint-space target for a configured robot control part."""
+
+    qpos: torch.Tensor
+    """Target joint positions.
+
+    Accepts:
+
+    - ``(control_dof,)`` or ``(n_envs, control_dof)`` — a single waypoint.
+    - ``(n_envs, n_waypoint, control_dof)`` — a multi-waypoint trajectory;
+      waypoints are visited in order.
+    """
+
+
+@dataclass(frozen=True)
+class NamedJointPositionTarget:
+    """Named joint-space target resolved from ``MoveJointsCfg``."""
+
+    name: str
+    """Name of a joint-position target in ``MoveJointsCfg.named_joint_positions``."""
+
+
+@dataclass(frozen=True)
+class GraspTarget:
+    """Pickup target with an affordance-selected or explicitly supplied grasp pose."""
+
+    semantics: ObjectSemantics
+
+    grasp_xpos: torch.Tensor | None = None
+    """Optional end-effector grasp pose.
+
+    When omitted, :class:`PickUp` selects a grasp from the target affordance.
+    Supplying a pose with shape ``(4, 4)`` or ``(n_envs, 4, 4)`` skips grasp
+    sampling, which is useful when perception or task geometry has already
+    selected a grasp.
+    """
+
+
+@dataclass(frozen=True)
+class HeldObjectPoseTarget:
+    """Move the currently-held object to a desired object pose."""
+
+    object_target_pose: torch.Tensor
+    """(4, 4) or (n_envs, 4, 4) target pose for the held object."""
+
+
+@dataclass(frozen=True)
+class CoordinatedPickmentTarget:
+    """Object-centric target for picking and moving one object with two hands."""
+
+    object_target_pose: torch.Tensor
+    """Target pose for the shared object, shape ``(4, 4)`` or ``(n_envs, 4, 4)``."""
+
+    object_semantics: ObjectSemantics
+    """Semantic description of the shared object."""
+
+    left_object_to_eef: torch.Tensor
+    """Transform from object frame to left end-effector frame."""
+
+    right_object_to_eef: torch.Tensor
+    """Transform from object frame to right end-effector frame."""
+
+    object_initial_pose: torch.Tensor | None = None
+    """Optional initial object pose. Defaults to ``object_semantics.entity`` pose."""
+
+
+@dataclass(frozen=True)
+class CoordinatedPlacementTarget:
+    """Object-centric target for dual-arm coordinated placement."""
+
+    placing_object_target_pose: torch.Tensor
+    """Target pose for the object released by the placing arm."""
+
+    support_object_target_pose: torch.Tensor
+    """Target pose for the object held by the support arm."""
+
+    placing_held_object: HeldObjectState
+    """Held-object state for the placing arm."""
+
+    support_held_object: HeldObjectState
+    """Held-object state for the support arm."""
+
+    placing_height_offset: float | None = None
+    """World-Z offset above the placing object target pose."""
+
+    support_height_offset: float | None = None
+    """World-Z offset above the support object target pose."""
+
+    release: bool | None = None
+    """Whether the placing hand releases. ``None`` uses the action config."""
+
+
+Target = (
+    EndEffectorPoseTarget
+    | JointPositionTarget
+    | NamedJointPositionTarget
+    | GraspTarget
+    | HeldObjectPoseTarget
+    | CoordinatedPickmentTarget
+    | CoordinatedPlacementTarget
+)
+
+
+# =============================================================================
+# World state threaded between actions
+# =============================================================================
+
+
+@dataclass
+class HeldObjectState:
+    """State of an object currently held by the robot."""
+
+    semantics: ObjectSemantics
+    """Semantics of the held object."""
+
+    object_to_eef: torch.Tensor
+    """Batched transform from object frame to end-effector frame, shape [n_envs, 4, 4]."""
+
+    grasp_xpos: torch.Tensor
+    """Batched end-effector pose used to grasp the object, shape [n_envs, 4, 4]."""
+
+
+@dataclass
+class CoordinatedHeldObjectState:
+    """State of a single object jointly held by two robot hands."""
+
+    semantics: ObjectSemantics
+    """Semantic object currently held by the two grippers."""
+
+    left_object_to_eef: torch.Tensor
+    """Transform from object frame to left end-effector frame, shape ``[n_envs, 4, 4]``."""
+
+    right_object_to_eef: torch.Tensor
+    """Transform from object frame to right end-effector frame, shape ``[n_envs, 4, 4]``."""
+
+    left_grasp_xpos: torch.Tensor
+    """Left end-effector grasp pose for the shared object, shape ``[n_envs, 4, 4]``."""
+
+    right_grasp_xpos: torch.Tensor
+    """Right end-effector grasp pose for the shared object, shape ``[n_envs, 4, 4]``."""
+
+
+@dataclass
+class WorldState:
+    """State the engine threads through a sequence of actions."""
+
+    last_qpos: torch.Tensor
+    """Robot joint positions at the start of the next action, shape [n_envs, robot.dof]."""
+
+    held_object: HeldObjectState | None = None
+    """Object currently held by the gripper, or None."""
+
+    coordinated_held_object: CoordinatedHeldObjectState | None = None
+    """Object currently held by two grippers, or None."""
+
+
+@dataclass
+class ActionResult:
+    """Return value of every AtomicAction.execute call."""
+
+    success: bool | torch.Tensor
+    """Whether the action produced a valid full-DoF trajectory.
+    Can be a bool or a per-environment boolean tensor of shape (n_envs,)."""
+
+    trajectory: torch.Tensor
+    """Full-robot trajectory, shape (n_envs, n_waypoints, robot.dof)."""
+
+    next_state: WorldState
+    """World state to feed into the next action."""
+
+    @property
+    def success_all(self) -> bool:
+        """True only if all environments succeeded."""
+        if isinstance(self.success, torch.Tensor):
+            return bool(torch.all(self.success).item())
+        return bool(self.success)
+
+    def __bool__(self) -> bool:
+        import warnings as _w
+
+        _w.warn(
+            "ActionResult bool() is deprecated; use .success_all",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.success_all
+
+
+# =============================================================================
+# Configuration base
+# =============================================================================
+
+
+@configclass
+class ActionCfg:
+    """Configuration shared by all atomic actions."""
+
+    name: str = "default"
+    control_part: str = "arm"
+    interpolation_type: str = "linear"
+    velocity_limit: float | None = None
+    acceleration_limit: float | None = None
+    motion_source: str = "ik_interp"
+    """Trajectory source: 'ik_interp' (default, batched IK + linear interp)
+    or 'motion_gen' (batched MotionGenerator)."""
+    planner_type: str | None = None
+    """Planner type for motion_source='motion_gen': 'toppra' | 'neural'.
+    Required when motion_source='motion_gen'."""
+
+
+# =============================================================================
+# AtomicAction ABC (slim)
+# =============================================================================
+
+
+class AtomicAction(ABC):
+    """Abstract base for atomic actions.
+
+    Subclasses declare ``TargetType`` to advertise the concrete target dataclass
+    they accept. ``execute`` is the only required method; ``validate`` has been
+    dropped from the contract in this redesign.
+    """
+
+    TargetType: ClassVar[type | tuple[type, ...]]
+    """Concrete target dataclass or dataclasses accepted by ``execute``."""
+
+    def __init__(
+        self,
+        motion_generator: MotionGenerator,
+        cfg: ActionCfg | None = None,
+    ) -> None:
+        self.motion_generator = motion_generator
+        self.cfg = cfg if cfg is not None else ActionCfg()
+        self.robot = motion_generator.robot
+        self.device = self.robot.device
+        self.control_part = self.cfg.control_part
+
+    @abstractmethod
+    def execute(self, target: Target, state: WorldState) -> ActionResult:
+        """Plan and return a full-DoF trajectory for this action.
+
+        Args:
+            target: Typed target dataclass; must be an instance of ``self.TargetType``.
+            state: World state inherited from the previous action (or the engine seed).
+
+        Returns:
+            ActionResult with the planned trajectory and the successor world state.
+        """
+
+
+__all__ = [
+    "ActionCfg",
+    "ActionResult",
+    "AtomicAction",
+    "CoordinatedHeldObjectState",
+    "CoordinatedPickmentTarget",
+    "CoordinatedPlacementTarget",
+    "GraspTarget",
+    "HeldObjectState",
+    "HeldObjectPoseTarget",
+    "JointPositionTarget",
+    "NamedJointPositionTarget",
+    "ObjectSemantics",
+    "EndEffectorPoseTarget",
+    "Target",
+    "WorldState",
+]
