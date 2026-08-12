@@ -1,0 +1,156 @@
+GitHub 代码更新上传操作流程
+============================
+
+项目路径：/home/user/Robotsynchallenge
+远程仓库：git@github.com:yinshinan/Robotsynchallenge.git
+默认分支：main
+
+
+一、进入项目目录
+----------------
+
+cd ~/Robotsynchallenge
+
+
+二、查看当前修改
+----------------
+
+git status
+
+确认显示的修改是本次准备上传的代码或配置文件。
+
+
+三、将修改加入暂存区
+--------------------
+
+git add -A
+
+说明：
+1. RoboSynChallenge/.gitignore 已配置忽略 lerobot_dataset/。
+2. 正常执行 git add -A 不会添加 RoboSynChallenge/lerobot_dataset/。
+3. 不要对该目录使用 git add -f，否则会绕过 .gitignore。
+
+
+四、确认 lerobot_dataset 没有进入暂存区
+---------------------------------------
+
+git ls-files --cached -- 'RoboSynChallenge/lerobot_dataset/**'
+
+正确结果：该命令没有任何输出。
+
+也可以确认忽略规则是否生效：
+
+git check-ignore -v RoboSynChallenge/lerobot_dataset
+
+正常情况下会显示 RoboSynChallenge/.gitignore 中的 lerobot_dataset/ 规则。
+
+
+五、检查本次准备提交的内容
+--------------------------
+
+git status
+git diff --cached --stat
+
+如需查看暂存区内的全部文件名：
+
+git diff --cached --name-only
+
+重点确认没有以下内容：
+
+RoboSynChallenge/lerobot_dataset/
+outputs/
+checkpoints/
+.venv/
+__pycache__/
+
+
+六、创建本地提交
+----------------
+
+git commit -m "描述本次修改内容"
+
+示例：
+
+git commit -m "Fix handle basket training configuration"
+
+如果提示 nothing to commit，表示暂存区没有需要提交的修改。
+
+
+七、同步 GitHub 上的最新提交
+----------------------------
+
+git pull --rebase origin main
+
+如果只有自己维护该仓库，并且远程没有新提交，该命令通常会提示已经是最新状态。
+如果出现冲突，不要强制推送；先解决冲突，再继续 rebase：
+
+git status
+git add <已经解决冲突的文件>
+git rebase --continue
+
+如果需要放弃本次 rebase：
+
+git rebase --abort
+
+
+八、推送到 GitHub
+-----------------
+
+git push origin main
+
+推送成功后，可以执行以下命令确认状态：
+
+git status
+
+正常情况下应显示工作区干净，并且本地 main 与 origin/main 同步。
+
+
+九、日常操作的完整命令顺序
+--------------------------
+
+cd ~/Robotsynchallenge
+git status
+git add -A
+git ls-files --cached -- 'RoboSynChallenge/lerobot_dataset/**'
+git diff --cached --stat
+git commit -m "Update project code"
+git pull --rebase origin main
+git push origin main
+git status
+
+
+十、数据集意外进入暂存区时的处理
+--------------------------------
+
+如果检查命令意外显示了 lerobot_dataset 中的文件，执行：
+
+git restore --staged -- 'RoboSynChallenge/lerobot_dataset'
+
+该命令只会将数据集移出 Git 暂存区，不会删除本地数据，也不会影响正在训练的进程。
+
+然后再次检查：
+
+git ls-files --cached -- 'RoboSynChallenge/lerobot_dataset/**'
+
+没有输出后再进行 commit。
+
+
+十一、注意事项
+--------------
+
+1. 不要执行：
+
+   git add -f RoboSynChallenge/lerobot_dataset
+
+2. 不要为了处理普通推送冲突直接执行：
+
+   git push --force
+
+3. 不要在未确认用途的情况下执行以下可能修改或删除本地文件的命令：
+
+   git reset --hard
+   git clean -fd
+
+4. git config user.name 和 git config user.email 控制提交作者信息；SSH 密钥控制实际使用哪个 GitHub 账号进行身份验证。
+
+5. 训练可以继续向被忽略的目录写入文件；.gitignore 只影响 Git 跟踪，不会阻止训练写入数据、日志或 checkpoint。
