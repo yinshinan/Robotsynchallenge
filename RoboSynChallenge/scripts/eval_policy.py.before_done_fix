@@ -570,12 +570,12 @@ def main():
                         infer_time=f"{policy_eval_time_s:.3f}s",
                     )
 
-                    if env.get_wrapper_attr("is_task_success")():
+                    if not truncated and env.get_wrapper_attr("is_task_success")():
                         episode_success = True
                         progress_bar.write("Task success!")
                         break
                     if truncated:
-                        progress_bar.write("Task terminated or timeout!")
+                        progress_bar.write("Task timeout!")
                         break
             finally:
                 if progress_bar:

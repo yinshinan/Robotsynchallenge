@@ -51,29 +51,10 @@ def get_model(usr_args):
         policy.config.n_action_steps = requested_n_action_steps
         policy.reset()
 
-    action_chunk_offset = int(usr_args.get("action_chunk_offset", 0))
-    max_offset = int(policy.config.chunk_size) - int(policy.config.n_action_steps)
-    if not 0 <= action_chunk_offset <= max_offset:
-        raise ValueError(
-            f"action_chunk_offset must be between 0 and {max_offset}, "
-            f"got {action_chunk_offset}."
-        )
-
-    policy.action_chunk_offset = action_chunk_offset
-    if action_chunk_offset:
-        original_predict_action_chunk = policy.predict_action_chunk
-
-        def predict_action_chunk_with_offset(batch):
-            actions = original_predict_action_chunk(batch)
-            return actions[:, action_chunk_offset:]
-
-        policy.predict_action_chunk = predict_action_chunk_with_offset
-
     print(
         "[ACT CONFIG]",
         f"chunk_size={policy.config.chunk_size}",
         f"n_action_steps={policy.config.n_action_steps}",
-        f"action_chunk_offset={policy.action_chunk_offset}",
         flush=True,
     )
 
@@ -96,11 +77,6 @@ def get_model(usr_args):
     policy.strict_action_dim = bool(usr_args.get("strict_action_dim", True))
     policy.neutralize_qvel = bool(usr_args.get("neutralize_qvel", False))
     policy.debug_button_press = bool(usr_args.get("debug_button_press", False))
-    policy.debug_trajectory = bool(usr_args.get("debug_trajectory", False))
-    policy.debug_trajectory_steps = int(
-        usr_args.get("debug_trajectory_steps", 100)
-    )
-    policy._trajectory_debug_count = 0
     policy.act_image_keys = image_keys
     policy.image_key_map = image_key_map
 
@@ -269,47 +245,6 @@ def eval(env, model, obs):
                 raise ValueError(message)
             action = action[:, :env_action_dim]
 
-        # Dataset gripper actions are normalized to [0, 1], while the
-        # simulator expects the physical prismatic-joint range [0, 0.05].
-        action = action.clone()
-        action_low = torch.as_tensor(
-            env.unwrapped.single_action_space.low,
-            device=action.device,
-            dtype=action.dtype,
-        )
-        action_high = torch.as_tensor(
-            env.unwrapped.single_action_space.high,
-            device=action.device,
-            dtype=action.dtype,
-        )
-
-        gripper_ids = [6, 13]
-        action[:, gripper_ids] = (
-            action_low[gripper_ids]
-            + action[:, gripper_ids].clamp(0.0, 1.0)
-            * (action_high[gripper_ids] - action_low[gripper_ids])
-        )
-
-        if (
-            model.debug_trajectory
-            and model._trajectory_debug_count < model.debug_trajectory_steps
-        ):
-            state_text = ",".join(
-                f"{x:.9g}" for x in state_tensor[0].detach().cpu().tolist()
-            )
-            action_text = ",".join(
-                f"{x:.9g}" for x in action[0].detach().cpu().tolist()
-            )
-            print(
-                "[TRAJECTORY DEBUG]",
-                f"step={model._trajectory_debug_count}",
-                f"state={state_text}",
-                f"action={action_text}",
-                flush=True,
-            )
-
-        model._trajectory_debug_count += 1
-
         action_tensor = action.detach().to(
             device=env.unwrapped.device,
             dtype=torch.float32,
@@ -350,4 +285,3 @@ def eval(env, model, obs):
 def reset_model(model):
     model.reset()
     model._max_button_press_depth = 0.0
-    model._trajectory_debug_count = 0

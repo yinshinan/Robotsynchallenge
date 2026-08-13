@@ -44,37 +44,7 @@ class HandleBasketEnv(EmbodiedEnv):
         self.agent_qpos_flip_threshold = 3.455751918948773
         self.agent_qpos_flip_mode = "delta"
 
-    def _initialize_episode(self, env_ids=None, **kwargs) -> None:
-        # Parent initialization resets objects and applies reset randomization.
-        super()._initialize_episode(env_ids=env_ids, **kwargs)
 
-        # Do not carry success-state variables across episodes.
-        for attr_name in tuple(vars(self)):
-            if attr_name.startswith("_hb_"):
-                delattr(self, attr_name)
-
-        # Record the basket pose after this episode's reset/randomization.
-        basket = self.sim.get_rigid_object("basket")
-        basket_pose = basket.get_local_pose(to_matrix=True)
-
-        if basket_pose.ndim == 3:
-            pose = basket_pose[0]
-        else:
-            pose = basket_pose
-
-        self._hb_stage = 0
-        self._hb_lifted_count = 0
-        self._hb_stable_count = 0
-        self._hb_seen_grasp = False
-        self._hb_orig_basket_x = float(pose[0, 3])
-        self._hb_orig_basket_z = float(pose[2, 3])
-
-        print(
-            "[HB RESET]"
-            f" orig_x={self._hb_orig_basket_x:.6f}"
-            f" orig_z={self._hb_orig_basket_z:.6f}",
-            flush=True,
-        )
 
     def get_arm_fk(
         self, qpos: np.ndarray, control_part: str, is_world_coordinates=True
@@ -531,53 +501,6 @@ class HandleBasketEnv(EmbodiedEnv):
                     self._hb_stable_accum_start = None
                 # keep legacy counter as fallback
                 self._hb_stable_count = 0
-
-        # Temporary HandleBasket success-state diagnostics.
-        self._hb_debug_count = getattr(self, "_hb_debug_count", 0) + 1
-        previous_stage = getattr(self, "_hb_debug_last_stage", None)
-
-        if (
-            previous_stage != self._hb_stage
-            or self._hb_debug_count % 25 == 0
-            or success
-        ):
-            orig_x_dbg = getattr(self, "_hb_orig_basket_x", None)
-            orig_z_dbg = getattr(self, "_hb_orig_basket_z", None)
-            dx_dbg = (
-                None
-                if orig_x_dbg is None
-                else float(orig_x_dbg) - cur_basket_x
-            )
-            dz_dbg = (
-                None
-                if orig_z_dbg is None
-                else cur_basket_z - float(orig_z_dbg)
-            )
-            stable_start_dbg = getattr(
-                self, "_hb_stable_accum_start", None
-            )
-            stable_secs_dbg = (
-                None
-                if stable_start_dbg is None
-                else float(now_ts) - float(stable_start_dbg)
-            )
-
-            print(
-                "[HB STAGE DEBUG]"
-                f" stage={self._hb_stage}"
-                f" in_basket={in_basket}"
-                f" dx={dx_dbg}"
-                f" dz={dz_dbg}"
-                f" lifted={locals().get('lifted')}"
-                f" moved_left={locals().get('moved_left')}"
-                f" lift_count={getattr(self, '_hb_lifted_count', None)}"
-                f" placed_down={locals().get('placed_down')}"
-                f" stable_secs={stable_secs_dbg}"
-                f" success={success}",
-                flush=True,
-            )
-
-        self._hb_debug_last_stage = self._hb_stage
 
         # Return torch tensor boolean for compatibility
         import torch as _torch

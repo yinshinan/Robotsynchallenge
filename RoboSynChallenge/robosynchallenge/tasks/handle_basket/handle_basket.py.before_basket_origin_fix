@@ -44,37 +44,7 @@ class HandleBasketEnv(EmbodiedEnv):
         self.agent_qpos_flip_threshold = 3.455751918948773
         self.agent_qpos_flip_mode = "delta"
 
-    def _initialize_episode(self, env_ids=None, **kwargs) -> None:
-        # Parent initialization resets objects and applies reset randomization.
-        super()._initialize_episode(env_ids=env_ids, **kwargs)
 
-        # Do not carry success-state variables across episodes.
-        for attr_name in tuple(vars(self)):
-            if attr_name.startswith("_hb_"):
-                delattr(self, attr_name)
-
-        # Record the basket pose after this episode's reset/randomization.
-        basket = self.sim.get_rigid_object("basket")
-        basket_pose = basket.get_local_pose(to_matrix=True)
-
-        if basket_pose.ndim == 3:
-            pose = basket_pose[0]
-        else:
-            pose = basket_pose
-
-        self._hb_stage = 0
-        self._hb_lifted_count = 0
-        self._hb_stable_count = 0
-        self._hb_seen_grasp = False
-        self._hb_orig_basket_x = float(pose[0, 3])
-        self._hb_orig_basket_z = float(pose[2, 3])
-
-        print(
-            "[HB RESET]"
-            f" orig_x={self._hb_orig_basket_x:.6f}"
-            f" orig_z={self._hb_orig_basket_z:.6f}",
-            flush=True,
-        )
 
     def get_arm_fk(
         self, qpos: np.ndarray, control_part: str, is_world_coordinates=True

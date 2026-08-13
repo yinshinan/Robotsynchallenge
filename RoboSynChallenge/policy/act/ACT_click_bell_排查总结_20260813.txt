@@ -1,0 +1,464 @@
+RoboSynChallenge ACT click_bell 排查总结
+日期：2026-08-13
+工作目录：/home/user/Robotsynchallenge/RoboSynChallenge/policy/act
+
+============================================================
+一、当前目标
+============================================================
+
+排查 ACT 策略在 click_bell 任务中 clear 和 random 均失败的问题。
+
+主要 checkpoint：
+/home/user/Robotsynchallenge/RoboSynChallenge/outputs/act_click_bell_mixed1100_bs8_v0/checkpoints/080000/pretrained_model
+
+训练数据：
+/home/user/Robotsynchallenge/RoboSynChallenge/lerobot_dataset/click_bell/cobotmagic_Sim_click_bell_official1000_custom100_v0
+
+主要固定评测 seed：209652396
+已找到专家可解的 random seed：398764591
+
+
+============================================================
+二、环境与下载问题（已经解决）
+============================================================
+
+1. Hugging Face CLI 已成功登录，Token 权限为 read。
+2. 登录前出现 socks://127.0.0.1:7897 代理格式错误；执行以下命令后登录成功：
+
+   unset HF_ENDPOINT ALL_PROXY all_proxy
+   hf auth login --force
+
+3. 不要在新对话或日志中粘贴真实 Token。曾公开显示过的 Token 应当在 Hugging Face 网站中撤销并重新生成。
+4. 下载出现 Hugging Face lock 等待，通常表示另一个进程正在下载同一个文件，不是登录失败。
+
+
+============================================================
+三、早期运行问题（已经解决）
+============================================================
+
+1. 曾出现：
+   ModuleNotFoundError: No module named 'dexsim'
+   原因是环境/解释器依赖不完整，后续已能正常启动 DexSim 和执行评测。
+
+2. 手工加入调试代码时曾出现 deploy_policy.py 缩进错误：
+   IndentationError
+   文件后来已经恢复并重新加入了正确缩进的调试代码。
+
+
+============================================================
+四、已经核对的模型和数据配置
+============================================================
+
+Checkpoint 配置：
+
+- ACT
+- chunk_size = 50
+- n_action_steps = 10
+- 输入 observation.state：14 维
+- 输入 observation.qvel：14 维
+- 输入 observation.qf：14 维
+- 输出 action：14 维
+- 三路相机：
+  observation.images.cam_high
+  observation.images.cam_right_wrist
+  observation.images.cam_left_wrist
+
+部署动作维度、关节次序和三路相机 key 映射表面上均一致。
+
+Checkpoint 中保存的 observation/action mean、std 已与训练数据 stats.json 核对，一致。
+
+离线训练帧检查时 checkpoint 对专家动作的 MAE 大致为 0.002～0.012，说明权重能够拟合部分训练样本，不属于完全未训练或权重加载错误。
+
+
+============================================================
+五、qf 与 qvel 排查结果
+============================================================
+
+1. qf：
+
+- 训练数据 qf 全为 0。
+- 实时评测 qf 也严格全为 0。
+- 因此“零方差 qf + 非零实时 qf”不是本次失败原因。
+
+典型输出：
+
+[INPUT DEBUG] qf absmax: 0.0
+[INPUT DEBUG] qf: [0.0, ..., 0.0]
+
+2. qvel：
+
+- 实时 raw qvel 最大值约 0.0535。
+- 因训练数据部分 qvel 标准差非常小，归一化后最大值约 27.84，确实异常大。
+- 但把 qvel 临时固定为训练均值（neutralize_qvel=True）后，多 seed 仍然 0/5。
+- 所以 qvel 不是主要决定因素，虽然未来重新训练时仍建议处理 qvel 低方差问题。
+
+
+============================================================
+六、成功判定与按钮按压深度
+============================================================
+
+按钮成功阈值：0.0048 m
+按钮最大行程约：0.005 m
+
+之前错误地把 0.00095 m 理解为“ACT 按下约 20%”。
+后来的专家逐步回放证明，0.000949 m 很可能只是按钮经过物理稳定后的基线位置：
+
+- 专家第 35～48 步一直是约 0.000949 m。
+- 专家第 49 步直接变成约 0.005 m，并成功。
+- ACT 自由运行的最大值始终约 0.00095 m。
+
+因此更准确的结论是：ACT 没有形成有效按压，而不是已经按下了 20%。
+
+
+============================================================
+七、checkpoint 对照结果
+============================================================
+
+固定 seed 209652396，clear，最大按压深度：
+
+- 020000：0.0009593101 m，FAIL
+- 040000：DexSim 初始化期间段错误，没有有效结果
+- 060000：0.0009489073 m，FAIL
+- 080000：0.0009590270 m，FAIL
+
+020k、060k、080k 几乎完全一致。
+
+结论：
+
+- 基本排除 checkpoint 选择不合适。
+- 基本排除训练后期退化。
+- 没必要继续大量筛选 checkpoint。
+
+注意：用户 shell 没有 rg。发送给用户的日志筛选命令应使用：
+
+grep -aE '表达式' 日志文件
+
+日志包含二进制/NUL 字符，因此需要 grep -a。
+
+
+============================================================
+八、reset sync 与多 seed 结果
+============================================================
+
+1. eval_reset_sync_steps=0 时曾出现过一次同 seed 的偶然成功，但后续重复和 5 seed 测试均不稳定。
+2. clear 5 个 seed 最终为 0/5。
+3. DONE DEBUG 显示失败是环境步数耗尽导致 truncated=True，不是 success 信号遗漏：
+
+[DONE DEBUG] terminated=tensor([False]) truncated=tensor([True])
+
+结论：reset sync 不是稳定主因。
+
+
+============================================================
+九、ACT action chunk 时序排查
+============================================================
+
+重要发现：
+
+- 外层 deploy_policy.py 的 act_step 只控制一次 adapter eval() 内执行多少个 env.step。
+- ACTPolicy.select_action() 内部拥有自己的动作队列。
+- 真正控制模型每次生成 chunk 后连续执行多少动作的是 policy.config.n_action_steps。
+- 旧的 act_step=1/2/5/10 对照没有真正改变 ACT 重新规划频率。
+
+因此后来增加了 n_action_steps 命令行覆盖。
+
+使用：
+
+--n_action_steps 1
+
+结果：
+
+[ACT CONFIG] chunk_size=50 n_action_steps=1
+[PRESS DEBUG] max_press_depth=0.0009489073 success_threshold=0.0048
+
+与 n_action_steps=10 完全一致。
+
+结论：
+
+- ACT 动作队列长度/重新规划频率不是本次失败原因。
+- 没必要继续测试 n_action_steps=2、5。
+
+
+============================================================
+十、当前专家动作测试
+============================================================
+
+独立脚本：
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/debug_expert_press.py
+
+它使用当前环境、当前 action bank、当前控制器和当前按钮资产执行专家动作，并记录按钮深度；不加载 ACT，不保存数据集，不修改任务源码。
+
+clear，seed=209652396，reset_sync_steps=1：
+
+[EXPERT CONFIG] setting=clear seed=209652396 actions=74 reset_sync_steps=1
+[EXPERT PRESS DEBUG] max_press_depth=0.004999999888241291 success_threshold=0.0048 first_success_step=49
+[EXPERT RESULT] success=True
+
+random，seed=398764591，reset_sync_steps=1：
+
+[EXPERT CONFIG] setting=random seed=398764591 actions=74 reset_sync_steps=1
+[EXPERT PRESS DEBUG] max_press_depth=0.004999999888241291 success_threshold=0.0048 first_success_step=49
+[EXPERT RESULT] success=True
+
+结论：
+
+- 当前环境本身可解。
+- 当前按钮物理正常。
+- 当前成功阈值正常。
+- 当前动作接口和控制器正常。
+- 问题集中在 ACT 生成的闭环轨迹。
+
+补充：EXPERT RESULT 的 final_info 中 success=False 并不矛盾。click_bell 的 compute_task_state 会通过内部 _button_pressed 累积成功状态，正式检查调用 is_task_success()，后者确实返回 True。
+
+
+============================================================
+十一、random seed 209652396 的专家失败
+============================================================
+
+random + seed=209652396 时专家生成失败：
+
+Validation function get_ik_ret returns False
+Failed to generate button_prepress_pre_qpos
+UnexpectedError 'button_up_qpos': 'button_prepress_pre_qpos'
+
+这是随机按钮/机器人初始条件下 IK 无解，不是 ACT 推理错误。
+数据采集器通常会丢弃这种尝试并重新采样。
+
+已找到专家可解的 random seed：398764591。
+
+
+============================================================
+十二、clear 教师强制对照结果
+============================================================
+
+独立脚本：
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/debug_teacher_forced_act.py
+
+原理：
+
+- 环境始终执行专家动作。
+- ACT 在每一个专家状态和实时专家图像上预测一次动作。
+- 每步清空 ACT 队列，比较该状态下 chunk 的第一个动作。
+- 保存 state、expert action、predicted action、逐关节误差和按钮深度到 CSV。
+
+clear 输出 CSV：
+/tmp/act_click_bell_teacher_forced.csv
+
+clear，seed=209652396 结果：
+
+[TEACHER SUMMARY]
+mean_mae=0.021934
+max_step_mae=0.036181
+mean_right_mae=0.019326
+contact_right_mae=0.009775
+first_success_step=49
+
+接触阶段第 40～48 步，右臂 MAE 大致从 0.0078 降到 0.0063；
+第 49 步按钮达到 0.005 m 时 right_mae=0.010244。
+
+完整逐关节平均绝对误差：
+
+索引 0～13：
+[0.024168, 0.000887, 0.001569, 0.035917, 0.003912, 0.105334, 0.0,
+ 0.015640, 0.064710, 0.036712, 0.002568, 0.006216, 0.009437, 0.0]
+
+突出异常：
+
+- 左臂索引 5：平均误差约 0.105 rad
+- 右臂索引 8：平均误差约 0.0647 rad
+- 左臂索引 3：平均误差约 0.0359 rad
+
+模型在第 1 步就有明显偏差：
+
+- 左臂索引 5：专家约 0.1337，ACT 约 0.0324
+- 右臂索引 8：专家约 0.0098，ACT 约 -0.1138
+
+这说明闭环漂移在接触按钮之前就已经开始。
+
+归一化统计已经核对正确，因此这些固定偏差来自网络预测，不是 action 反归一化配置错误。
+
+
+============================================================
+十三、图像/视觉域初步发现
+============================================================
+
+已抽取并目视比较：
+
+1. 当前 clear 评测首帧：
+   - 没有餐具干扰物
+   - 按钮有明显颜色
+   - 场景亮度/外观与训练数据不同
+
+2. 官方训练 episode_000000 首帧：
+   - 有餐具干扰物
+   - 按钮接近白色
+   - 整体严重高亮
+
+3. custom episode_001000 首帧：
+   - 同样含有餐具干扰物
+   - 与当前 clear 并不相似
+
+4. 当前 random 评测首帧：
+   - 有餐具干扰物
+   - 白色按钮和高亮桌面
+   - 比 clear 更接近训练数据
+
+推断：clear 存在明显视觉域差异，这与 ACT 第 1 步即产生偏置动作相符。
+但 random 自由评测也失败，因此不能只用 clear 域差异解释全部问题。
+
+
+============================================================
+十四、当前代码修改与备份
+============================================================
+
+用户要求：每次修改现有代码前必须先备份原代码。
+
+当前 deploy_policy.py 已包含：
+
+- 输入 state/qvel/qf 调试输出
+- normalized state/qvel 调试输出
+- action delta 调试
+- gripper 调试
+- neutralize_qvel 开关
+- debug_button_press 开关
+- DONE DEBUG
+- n_action_steps 评测覆盖开关
+- 启动时打印：
+  [ACT CONFIG] chunk_size=... n_action_steps=...
+
+当前 deploy_policy.yml 包含：
+
+- neutralize_qvel: false
+- debug_button_press: false
+- n_action_steps: null
+
+n_action_steps=null 表示仍使用 checkpoint 默认值 10。
+
+主要备份：
+
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/debug_backups/deploy_policy.py.before_qf_debug_20260813_1730.bak
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/debug_backups/deploy_policy.py.before_press_depth_debug_20260813_1730.bak
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/debug_backups/deploy_policy.yml.before_press_depth_debug_20260813_1730.bak
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/debug_backups/deploy_policy.py.before_n_action_steps_override_20260813_1755.bak
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/debug_backups/deploy_policy.yml.before_n_action_steps_override_20260813_1755.bak
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/debug_backups/debug_teacher_forced_act.py.before_setting_option_20260813_1810.bak
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/debug_backups/debug_expert_press.py.before_setting_option_20260813_1812.bak
+
+任务源码 click_bell.py 没有因为按压深度调试被修改。
+曾经尝试修改任务源码，但操作被中断；随后检查确认没有加入 _max_press_depth 等代码。
+
+
+============================================================
+十五、当前需要继续执行的测试
+============================================================
+
+目前停在：已找到专家可解的 random seed=398764591，但还没有成功获得 random 教师强制对照的 TEACHER SUMMARY。
+
+在新对话中首先运行：
+
+cd /home/user/Robotsynchallenge/RoboSynChallenge/policy/act
+
+export VALID_SEED=398764591
+export CKPT=/home/user/Robotsynchallenge/RoboSynChallenge/outputs/act_click_bell_mixed1100_bs8_v0/checkpoints/080000/pretrained_model
+export LOG=/tmp/act_click_bell_teacher_random_valid.log
+
+MPLCONFIGDIR=/tmp/matplotlib-act-debug \
+CUDA_VISIBLE_DEVICES=0 \
+.venv/bin/python debug_teacher_forced_act.py \
+  --checkpoint "$CKPT" \
+  --setting random \
+  --seed "$VALID_SEED" \
+  --gpu-id 0 \
+  --headless \
+  --reset-sync-steps 1 \
+  --csv /tmp/act_click_bell_teacher_random_valid.csv \
+  > "$LOG" 2>&1
+
+完成后：
+
+grep -aE '\[ACT CONFIG\]|\[TEACHER CONFIG\]|\[TEACHER SUMMARY\]|\[TEACHER JOINT MAE\]|Traceback|Error|段错误' "$LOG"
+
+正确结果必须包含：
+
+[TEACHER CONFIG]
+[TEACHER SUMMARY]
+[TEACHER JOINT MAE]
+
+不要再次把下面这些专家筛选结果误认为教师强制结果：
+
+[EXPERT CONFIG]
+[EXPERT PRESS DEBUG]
+[EXPERT RESULT]
+
+
+============================================================
+十六、random 教师强制结果的判断方法
+============================================================
+
+clear 基准：
+
+mean_mae=0.021934
+mean_right_mae=0.019326
+contact_right_mae=0.009775
+
+判断：
+
+1. random 三项误差显著低于 clear：
+   - clear 失败主要受视觉域差异影响。
+   - random 失败更像是闭环小误差累积和缺乏恢复能力。
+   - 后续应考虑增加扰动恢复数据、接触阶段数据或 DAgger。
+
+2. random 误差与 clear 接近或更高：
+   - 不能只归因于 clear 视觉域差异。
+   - 下一步优先逐路相机消融或替换测试：cam_high、cam_right_wrist、cam_left_wrist。
+   - 检查是否有相机 key/左右腕映射、RGB/BGR、图像缩放或实时渲染版本差异。
+
+3. random 教师动作再次出现 get_ik_ret=False：
+   - 确认使用的是 seed=398764591。
+   - 不要使用 random seed=209652396，它已经确认 IK 无解。
+
+
+============================================================
+十七、目前已排除与尚未排除的原因
+============================================================
+
+已经基本排除：
+
+- Hugging Face 登录问题
+- checkpoint 未加载
+- checkpoint 选错/训练后期退化
+- qf 非零导致零方差爆炸
+- qvel 是唯一主因
+- state/action 统计量文件不匹配
+- 动作维度不匹配
+- 成功阈值或成功信号漏判
+- 按钮物理不可解
+- 当前控制器/专家动作接口不可用
+- ACT n_action_steps=10 的开环 chunk 长度是主因
+
+仍需重点检查：
+
+- random 场景下 ACT 在专家轨迹上的动作误差
+- 三路相机输入是否有一路错误或有害
+- 实时图像预处理是否与训练加载完全一致
+- 训练图像与当前 DexSim 渲染版本的域差异
+- 闭环误差累积与恢复能力不足
+- 混合数据中的 custom100 是否真的覆盖了目标 clear 外观
+- 训练数据动作/观测时间对齐是否存在一帧偏移（目前尚未决定性验证）
+
+
+============================================================
+十八、给新对话助手的操作要求
+============================================================
+
+1. 继续使用中文回答。
+2. 在修改任何现有文件前，先备份到：
+   /home/user/Robotsynchallenge/RoboSynChallenge/policy/act/debug_backups/
+   并用 sha256sum 验证备份与原文件一致。
+3. 不覆盖用户原有改动。
+4. 独立新增诊断脚本可直接创建；但后续修改该脚本时也应先备份。
+5. 用户 shell 没有 rg，命令示例使用 grep -aE。
+6. 不要让用户重复已经完成的 qf、qvel、checkpoint、n_action_steps 测试。
+7. 下一步必须先获得 random seed=398764591 的 TEACHER SUMMARY。
+8. 根据 random 与 clear 的误差对比，再决定相机消融或闭环恢复数据方向。
+
