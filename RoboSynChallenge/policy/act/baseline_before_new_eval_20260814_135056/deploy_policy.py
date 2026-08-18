@@ -113,7 +113,6 @@ def eval(env, model, obs):
     final_obs = obs
     info = None
     truncated = False
-    executed_action_steps = 0
 
     for _ in range(model.act_step):
         if model.debug_button_press:
@@ -316,8 +315,6 @@ def eval(env, model, obs):
             dtype=torch.float32,
         )
         final_obs, reward, terminated, truncated, info = env.step(action_tensor)
-        executed_action_steps += 1
-        info["_policy_action_steps"] = executed_action_steps
         def _is_done(value):
             if isinstance(value, torch.Tensor):
                 return bool(value.any().item())

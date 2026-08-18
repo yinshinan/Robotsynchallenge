@@ -289,7 +289,7 @@ class HandleBasketEnv(EmbodiedEnv):
         # thresholds and counters
         IN_BASKET_DIST = 0.10
         LIFT_Z_DELTA = 0.05
-        MOVE_X_DELTA = 0.05
+        MOVE_X_DELTA = 0.02
         LIFT_REQUIRED_FRAMES = 3
         # prefer time-based stability check (seconds). If no timestamp is
         # available from the caller/sim, we gracefully fall back to the

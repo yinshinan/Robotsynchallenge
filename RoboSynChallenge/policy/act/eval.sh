@@ -26,6 +26,7 @@ shift 4 2>/dev/null || true
 EXTRA_ARGS=("$@")
 
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
+export PYTHONUNBUFFERED=1
 
 
 echo "========================================="

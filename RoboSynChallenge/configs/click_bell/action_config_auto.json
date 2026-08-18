@@ -1,0 +1,5 @@
+{
+    "mode": "auto_arm",
+    "left_config_path": "configs/click_bell/action_config_left.json",
+    "right_config_path": "configs/click_bell/action_config.json"
+}

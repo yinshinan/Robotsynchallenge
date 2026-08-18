@@ -1318,8 +1318,8 @@
         "right_eef": [
             {
                 "ropen_grasp": {
-                    "src": "rclose",
-                    "sink": "ropen",
+                    "src": "lclose",
+                    "sink": "lopen",
                     "duration": 11,
                     "name": "execute_open",
                     "kwargs": {

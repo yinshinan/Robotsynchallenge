@@ -1,0 +1,123 @@
+click_bell 左右臂互补数据采集与 ACT 训练
+========================================
+
+一、环境要求
+
+数据采集必须在 RoboSynChallenge/EmbodiChain 数据生成环境中执行，不能在
+policy/act/.venv 中执行。ACT 环境的 LeRobot 版本用于训练，不兼容当前的
+LeRobotRecorder(metadata_buffer_size=1)。
+
+进入仓库根目录并激活数据生成环境：
+
+cd /home/user/Robotsynchallenge/RoboSynChallenge
+source .venv/bin/activate
+
+先检查环境；三项都必须能正常导入，且 LeRobot 应满足 EmbodiChain 要求的 >=0.4.4：
+
+python -c "import torch, embodichain, lerobot; print(torch.__version__, embodichain.__version__, lerobot.__version__)"
+
+当前 policy/act/.venv 中是 LeRobot 0.3.3，只能用于 ACT 训练/评测，不能用于本次
+数据采集。若仓库根目录的 .venv 也不能通过上述检查，应先按
+docs/getting_started/installation.md 修复官方数据生成环境。
+
+二、先做不保存数据的左臂测试
+
+python -m scripts.run_env \
+  --gym_config configs/click_bell/train_left/clear/gym_config.json \
+  --action_config configs/click_bell/action_config_left.json \
+  --num_envs 1 \
+  --max_episodes 20 \
+  --headless \
+  --filter_dataset_saving
+
+三、采集互补分区数据（推荐共 2000 条）
+
+左臂 clear 100 条：
+
+python -m scripts.run_env \
+  --gym_config configs/click_bell/train_left/clear/gym_config.json \
+  --action_config configs/click_bell/action_config_left.json \
+  --num_envs 1 \
+  --max_episodes 100 \
+  --headless
+
+左臂 random 900 条：
+
+python -m scripts.run_env \
+  --gym_config configs/click_bell/train_left/random/gym_config.json \
+  --action_config configs/click_bell/action_config_left.json \
+  --num_envs 1 \
+  --max_episodes 900 \
+  --headless
+
+右臂 clear 100 条：
+
+python -m scripts.run_env \
+  --gym_config configs/click_bell/train_right/clear/gym_config.json \
+  --action_config configs/click_bell/action_config.json \
+  --num_envs 1 \
+  --max_episodes 100 \
+  --headless
+
+右臂 random 900 条：
+
+python -m scripts.run_env \
+  --gym_config configs/click_bell/train_right/random/gym_config.json \
+  --action_config configs/click_bell/action_config.json \
+  --num_envs 1 \
+  --max_episodes 900 \
+  --headless
+
+说明：左臂使用官方范围的 y=[0.0, 0.3]，右臂使用 y=[-0.3, 0.0]；两边共享
+x=[0.4, 0.85]。连续随机采样恰好落在 y=0 的概率为零，因此不会产生相同场景的
+左右手冲突标签。官方 random/clear 配置没有被改动。
+
+四、转成 LeRobot 2.1
+
+上面每次运行都会打印实际数据集目录名。也可以查看最近四个目录：
+
+python scripts/_find_latest_datasets.py click_bell --count 4
+
+把下面的 <数据集目录名> 换成实际名字，对四个数据集分别执行：
+
+python scripts/convert_lerobot3.0_to_2.1.py \
+  --repo-id <数据集目录名> \
+  --root /home/user/Robotsynchallenge/RoboSynChallenge/lerobot_dataset/click_bell
+
+五、合并四个 2.1 数据集
+
+export HF_LEROBOT_HOME=/home/user/Robotsynchallenge/RoboSynChallenge/lerobot_dataset
+
+lerobot-edit-dataset \
+  --repo_id click_bell/cobotmagic_Sim_click_bell_bimanual2000_v0 \
+  --push_to_hub false \
+  --operation.type merge \
+  --operation.repo_ids "['click_bell/<左臂clear>', 'click_bell/<左臂random>', 'click_bell/<右臂clear>', 'click_bell/<右臂random>']"
+
+六、检查动作列
+
+LeRobot action 的索引含义：
+0:6 左臂关节；6 左夹爪；7:13 右臂关节；13 右夹爪。
+
+左臂数据应满足：action[:, 0:6] 有明显变化，action[:, 7:13] 基本不变。
+右臂数据应满足：action[:, 7:13] 有明显变化，action[:, 0:6] 基本不变。
+
+七、从头训练 ACT
+
+cd /home/user/Robotsynchallenge/RoboSynChallenge
+
+bash policy/act/finetune.sh \
+  /home/user/Robotsynchallenge/RoboSynChallenge/lerobot_dataset/click_bell/cobotmagic_Sim_click_bell_bimanual2000_v0 \
+  /home/user/Robotsynchallenge/RoboSynChallenge/outputs/act_click_bell_bimanual2000_bs8_v0 \
+  0 \
+  --steps 80000 \
+  --batch-size 8 \
+  --num-workers 2 \
+  --chunk-size 50 \
+  --n-action-steps 10 \
+  --save-freq 10000 \
+  --seed 1000 \
+  --overwrite
+
+不要在原有“只含右臂示范”的 checkpoint 上继续训练；建议从头训练，避免旧策略的
+右臂偏置继续保留。

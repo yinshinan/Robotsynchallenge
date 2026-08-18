@@ -45,8 +45,11 @@ EXTRA_ARGS=("$@")
 # Based on the new structure, gym_config is located in the random or clear folder under the task name
 GYM_CONFIG="configs/${TASK_NAME}/${SETTING}/gym_config.json"
 
-# action_config is usually in the task root directory, or under the corresponding setting folder
-if [ -f "configs/${TASK_NAME}/action_config.json" ]; then
+# Prefer an automatic action config when the task provides one, then fall back to
+# the standard task-level or setting-level action config.
+if [ -f "configs/${TASK_NAME}/action_config_auto.json" ]; then
+    ACTION_CONFIG="configs/${TASK_NAME}/action_config_auto.json"
+elif [ -f "configs/${TASK_NAME}/action_config.json" ]; then
     ACTION_CONFIG="configs/${TASK_NAME}/action_config.json"
 else
     # Fallback to check if it's placed in the random/clear folder
@@ -114,4 +117,3 @@ if [ "$FORMAT" == "2_1" ]; then
     fi
 fi
 chmod 777 -R "$REPO_ROOT/lerobot_dataset/"
-

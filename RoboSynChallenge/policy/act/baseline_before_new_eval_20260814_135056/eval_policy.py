@@ -326,18 +326,6 @@ def make_env_from_configs(config, gym_config_dict, action_config_dict):
     from embodichain.lab.sim.cfg import RenderCfg
 
     gym_config = deepcopy(gym_config_dict)
-    if bool(config.get("eval_freeze_interval_events", False)):
-        event_configs = gym_config.get("env", {}).get("events", {})
-        frozen_events = []
-        for event_name, event_config in event_configs.items():
-            if event_config.get("mode") == "interval":
-                event_config["mode"] = "reset"
-                frozen_events.append(event_name)
-        if frozen_events:
-            print(
-                "Freezing interval randomization within each eval episode: "
-                + ", ".join(frozen_events)
-            )
     _set_default(gym_config, "num_envs", int(config.get("num_envs", 1)))
     _set_default(gym_config, "device", config.get("device", "cpu"))
     _set_default(gym_config, "headless", bool(config.get("headless", False)))
@@ -621,12 +609,7 @@ def main():
 
             failure_reason = "None"
             if not episode_success:
-                if task_name == "click_bell":
-                    failure_reason = (
-                        "Button was not pressed deeply with valid centered "
-                        "gripper contact"
-                    )
-                elif _metric_bool("cup_fall"):
+                if _metric_bool("cup_fall"):
                     failure_reason = "Cup fell over"
                 elif _metric_bool("grasp_lost"):
                     failure_reason = "Bottle grasp was lost"

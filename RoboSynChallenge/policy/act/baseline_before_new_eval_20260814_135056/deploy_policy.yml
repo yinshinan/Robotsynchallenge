@@ -20,19 +20,18 @@ eval_video_obs_keys:
   - cam_right_wrist
   - cam_left_wrist
 eval_reset_sync_steps: 1
-eval_freeze_interval_events: true
 
 # ------------------------------------------------------------------
 # ACT Policy parameters used by get_model()
 # ------------------------------------------------------------------
 checkpoint_path: null
 act_step: 10
-n_action_steps: null  # null: use checkpoint value (10); set 1/2/5 for diagnosis
+n_action_steps: null  # null: use checkpoint value (50); set 1/2/5 for diagnosis
 action_chunk_offset: 0  # diagnostic: skip leading predicted actions
 state_obs_path: robot/qpos
 strict_action_dim: true
 neutralize_qvel: false
-neutralize_left_gripper_state: true
+neutralize_left_gripper_state: false
 debug_button_press: false
 debug_trajectory: false
 debug_trajectory_steps: 100

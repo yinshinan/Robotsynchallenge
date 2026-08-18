@@ -13,6 +13,92 @@ import torch
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
 
+
+def normalize_eef_observation(state_tensor, env):
+    """Convert physical gripper qpos to the normalized training representation."""
+    raw_env = env.unwrapped
+    active_joint_ids = list(raw_env.active_joint_ids)
+
+    global_to_active = {
+        joint_id: active_idx
+        for active_idx, joint_id in enumerate(active_joint_ids)
+    }
+
+    eef_active_indices = []
+    eef_global_joint_ids = []
+
+    for control_part in ("left_eef", "right_eef"):
+        joint_ids = raw_env.robot.get_joint_ids(
+            name=control_part,
+            remove_mimic=True,
+        )
+        for joint_id in joint_ids:
+            if joint_id in global_to_active:
+                eef_active_indices.append(global_to_active[joint_id])
+                eef_global_joint_ids.append(joint_id)
+
+    if not eef_active_indices:
+        raise RuntimeError(
+            "Could not find left_eef/right_eef joints in active_joint_ids."
+        )
+
+    index = torch.as_tensor(
+        eef_active_indices,
+        device=state_tensor.device,
+        dtype=torch.long,
+    )
+    robot_joint_ids = torch.as_tensor(
+        eef_global_joint_ids,
+        device=raw_env.device,
+        dtype=torch.long,
+    )
+
+    limits = raw_env.robot.body_data.qpos_limits[0, robot_joint_ids]
+    limits = limits.to(
+        device=state_tensor.device,
+        dtype=state_tensor.dtype,
+    )
+
+    low = limits[:, 0]
+    high = limits[:, 1]
+    span = torch.clamp(high - low, min=1e-8)
+
+    result = state_tensor.clone()
+    result[..., index] = (
+        result[..., index] - low
+    ) / span
+
+    # Training gripper observations represent normalized opening in [0, 1].
+    # Prevent simulator/mimic-joint overshoot from producing OOD policy input.
+    result[..., index] = torch.clamp(
+        result[..., index],
+        min=0.0,
+        max=1.0,
+    )
+
+    if not getattr(raw_env, "_eef_obs_normalization_debug_printed", False):
+        print("[EEF OBS FIX] env active joint ids:", active_joint_ids)
+        print(
+            "[EEF OBS FIX] robot active joint names:",
+            raw_env.robot.active_joint_names,
+        )
+        print("[EEF OBS FIX] robot control parts:", raw_env.robot.control_parts)
+        print("[EEF OBS FIX] active indices:", eef_active_indices)
+        print("[EEF OBS FIX] joint ids:", eef_global_joint_ids)
+        print("[EEF OBS FIX] low:", low.detach().cpu().tolist())
+        print("[EEF OBS FIX] high:", high.detach().cpu().tolist())
+        print(
+            "[EEF OBS FIX] physical:",
+            state_tensor[0, index].detach().cpu().tolist(),
+        )
+        print(
+            "[EEF OBS FIX] normalized:",
+            result[0, index].detach().cpu().tolist(),
+        )
+        raw_env._eef_obs_normalization_debug_printed = True
+
+    return result
+
 def get_model(usr_args):
     checkpoint_path = usr_args.get("checkpoint_path")
     if checkpoint_path is None:
@@ -131,6 +217,11 @@ def eval(env, model, obs):
         state_tensor = state.detach().to(device=model.act_device, dtype=torch.float32) if isinstance(state, torch.Tensor) else torch.as_tensor(state, dtype=torch.float32, device=model.act_device)
         if state_tensor.ndim == 1:
             state_tensor = state_tensor.unsqueeze(0)
+
+        state_tensor = normalize_eef_observation(
+            state_tensor,
+            env,
+        )
 
         qvel_tensor = torch.as_tensor(
             final_obs["robot"]["qvel"],
