@@ -1,0 +1,3 @@
+setting,episodes,successes,success_rate,initial_left_open_episodes,failures_with_initial_left_open,gripper_not_opened,open_but_no_effective_grasp,fork_not_lifted,spoon_not_lifted,both_lifted_but_not_placed,target_unstable_or_dropped,trace_evaluator_mismatch
+clear,20,18,0.9,0,0,0,1,0,0,1,0,0
+random,20,15,0.75,11,5,0,1,1,1,1,1,0

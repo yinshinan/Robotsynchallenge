@@ -1,0 +1,42 @@
+# Non-destructive table_rearrangement ACT diagnostics.
+# Run through scripts/eval_table_rearrangement_diag.py, not eval_policy.py.
+policy_name: act_table_rearrangement_diag
+task_name: table_rearrangement
+setting: clear
+train_config_name: diagnostic
+model_name: diagnostic
+seed: 0
+eval_fixed_episode_seed: 924231285
+max_episodes: 1
+max_steps: 361
+headless: true
+pytorch_device: cuda
+filter_dataset_saving: true
+eval_video_log: true
+eval_video_obs_keys:
+  - cam_high
+  - cam_right_wrist
+  - cam_left_wrist
+eval_reset_sync_steps: 1
+eval_freeze_interval_events: true
+
+checkpoint_path: null
+act_step: 10
+n_action_steps: 5
+action_chunk_offset: 0
+state_obs_path: robot/qpos
+strict_action_dim: true
+neutralize_qvel: false
+debug_button_press: false
+debug_trajectory: false
+image_key_map:
+  observation.images.cam_high: cam_high
+  observation.images.cam_right_wrist: cam_right_wrist
+  observation.images.cam_left_wrist: cam_left_wrist
+
+# Diagnostic-only switches.  All config changes happen in memory.
+diag_gripper_mode: physical       # physical | legacy_scaled
+diag_grasp_z_offset_m: 0.0        # compare with -0.008 or +0.005
+diag_correct_random_joint_ids: true
+diag_log_every: 1
+diag_log_path: diagnostic_logs/table_rearrangement_trace.jsonl

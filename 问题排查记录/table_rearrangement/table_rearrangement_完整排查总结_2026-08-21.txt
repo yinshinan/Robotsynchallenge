@@ -1,0 +1,794 @@
+table_rearrangement 完整排查总结与后续交接
+更新时间：2026-08-21
+
+======================================================================
+一、任务目标与最初故障现象
+======================================================================
+
+任务：排查 table_rearrangement 的失败原因。
+
+最初从失败视频观察到两个主要现象：
+1. 左右手靠近物品后，夹爪似乎都没有张开。
+2. 夹爪接近物体的位置没有准确对准物体，存在横向偏移。
+
+最初计划的最小对照实验顺序：
+1. 取消夹爪二次缩放，直接把模型输出的 0～0.05 m 发给环境。
+2. 同一 seed 比较 n_action_steps=50 和 1/5，观察横向偏差是否下降。
+3. 把抓取 z=-0.008 暂时改成 0，或先升高 5～10 mm，排除桌面碰撞。
+4. 核对并修正随机环境左右臂 joint IDs。
+5. 同时记录模型原始动作、发送给环境的动作、实际夹爪物理 qpos。
+6. 收紧成功判定后再统计成功率。
+
+用户要求：不要直接修改原有代码，所有诊断逻辑都放到新文件中。
+
+执行情况：整个排查过程中没有修改官方/原始任务和配置文件。新增内容都位于诊断脚本、诊断配置、日志和评估结果目录中。
+
+
+======================================================================
+二、当前可以确认的核心结论
+======================================================================
+
+1. 原始的“两只夹爪都没有张开”主要由夹爪动作的二次缩放导致。
+
+诊断版 deploy_policy.py 已将 ACT 动作向量中左右夹爪的有效索引 6 和 13 作为物理米制命令直接发送，并裁剪到 [0, 0.05]，不再经过旧的二次归一化/缩放。
+
+物理夹爪 qpos 通过运行时接口动态读取：
+- left_eef 的非 mimic 主关节
+- right_eef 的非 mimic 主关节
+
+在 joint IDs 修正后的随机 20-seed 测试中：
+- gripper_not_opened = 0
+- ineffective_grasp = 0
+- 不再出现“两边夹爪都不张开”的失败类型
+
+因此，直接发送物理夹爪动作已经解决最初最明确的夹爪不开问题。
+
+当前建议：继续保留物理夹爪直发方案，不要恢复旧的二次缩放。
+
+
+2. n_action_steps=50 明显优于 n_action_steps=5；不建议继续测试 1。
+
+对三条旧失败 seed 做过同 seed 的 n50/n5 对照。n5 三条都明显变差：
+
+- seed=209652396
+  n50：两件餐具都抬起，但最终没有同时放到严格目标范围。
+  n5：夹爪会张开，但没有形成有效抓取；fork/spoon 最终误差约 0.1243/0.0279 m。
+
+- seed=398764591
+  n50：两件都抬起，但未同时放稳。
+  n5：fork_not_lifted；fork/spoon 最终误差约 0.1722/0.0220 m。
+
+- seed=1537364731
+  n50：两件都抬起，但未同时放稳。
+  n5：夹爪张开但无有效抓取；fork/spoon 最终误差约 0.0976/0.1226 m。
+
+对应文件：
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/table_rearrangement_failed_seeds_n50_n5.csv
+
+结论：当前保持 n_action_steps=50。n5 没有改善横向偏差，反而破坏了动作时序；没有必要再测试 n1。
+
+
+3. 原始配置的 arm joint IDs [0..11] 是正确的；曾经做出的“修正”是错误的。
+
+运行时真实 joint 映射：
+- left_arm  = [0, 2, 4, 6, 8, 10]
+- right_arm = [1, 3, 5, 7, 9, 11]
+- left_eef  = [12, 13]
+- right_eef = [14, 15]
+
+因此，原始配置中 qpos 随机事件使用 [0,1,...,11]，正好覆盖全部 12 个 arm joints，并没有包含夹爪，原始设置是正确的。
+
+早期诊断文件 config_patch.py 曾错误地把 arm IDs 改为：
+[0,1,2,3,4,5,8,9,10,11,12,13]
+
+这个错误集合漏掉了一部分真正的臂关节，并错误包含 left_eef 的 12、13，导致随机 reset 时左夹爪在 11/20 个 episode 中被随机张开。
+
+受污染的旧结论：
+- 随机环境 15/20 = 75%
+- “失败与初始左夹爪异常张开相关”
+
+以上结论全部作废，不得继续引用。
+
+诊断版现已恢复为 list(range(12))；夹爪物理 IDs 也已改正为 [12,13,14,15]。
+
+使用原始 joint IDs 的真实 reset probe 结果：
+- 20/20 episode 左右夹爪都接近 0
+- current/target/sync/observation 中均没有异常打开
+- 异常 opening = 0/20
+
+对应文件：
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/random_reset_probe_summary.csv
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/random_reset_probe_original_ids.csv
+
+
+4. 严格成功判定已经生效，不能再只依赖环境原本较宽松的 success。
+
+诊断版 strict_task.py 的规则：
+- fork/spoon XY 目标误差阈值：0.035 m
+- Z 误差阈值：0.035 m
+- 最小抬起高度：0.020 m
+- 连续满足目标至少 5 个控制步
+
+目标并不是 plate 中心：
+- fork 目标：plate_y + 0.16 m
+- spoon 目标：plate_y - 0.16 m
+
+所以视频中餐具被放到盘子旁边并不一定是失败；需要以这两个偏置目标位置为准。
+
+
+5. 当前稳定失败不是“夹爪没开”，也没有证据表明是抓取 z 或桌面碰撞。
+
+在可复现包装器下得到的两个稳定失败视频中：
+- 右手夹爪确实正常张开。
+- 夹爪高度与成功案例接近。
+- spoon 从夹爪两指旁边经过并留在桌面上。
+- 主要差异是 spoon 与右手 approach 的水平 X 方向严重错位。
+
+最接近时右侧 link6 到 spoon 的相对向量：
+
+- seed=924231285
+  x=-0.0856 m, y=-0.0279 m, z=-0.1375 m
+  距离=0.1643 m
+  spoon 未抬起
+
+- seed=1879422756
+  x=-0.0765 m, y=-0.0019 m, z=-0.1379 m
+  距离=0.1577 m
+  spoon 未抬起
+
+成功案例中，同一阶段右手 link6 与 spoon 的水平 x/y 误差通常约在 ±0.018 m 内，z 则仍约为 -0.1375 m。
+
+因此，这两个稳定失败的直接表现是约 7.6～8.6 cm 的 X 向错误，而不是 Z 向碰桌，也不是夹爪不张开。
+
+对应分析文件：
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/table_rearrangement_spoon_alignment.csv
+
+
+======================================================================
+三、为什么普通 fixed seed 之前不能真正复现，以及如何修复
+======================================================================
+
+最初尝试单独用同一个 seed 录制视频时，发现 fork/spoon 的初始位置与连续 20-episode 运行中的同 seed 相差 8～18 cm；原来失败的三个 seed 单独运行后变成 2 个成功、1 个失败。
+
+根因位于原始文件：
+/home/user/Robotsynchallenge/RoboSynChallenge/robosynchallenge/managers/events.py
+
+关键机制：
+1. replace_distractor_slots_from_library 使用 Python random.sample。
+2. BaseEnv.reset(seed) 只调用 torch.manual_seed(seed)，没有同步 seed Python random 和 NumPy global RNG。
+3. distractor event 早于 init_fork_pose/init_spoon_pose 执行。
+4. _sample_positions 会根据 avoid_uids 和前一 episode 的旧物体位置进行数量不固定的 rejection resampling。
+5. rejection 次数变化会消耗数量不固定的 torch RNG，导致后续 fork/spoon 初始 pose 即使 seed 相同也依赖历史 episode。
+
+因此，旧流程中的 seed 不是独立可复现的；单 seed 结果不能与连续 20-episode 的同名 seed 直接比较。
+
+新增可复现诊断包装器：
+/home/user/Robotsynchallenge/RoboSynChallenge/scripts/eval_table_rearrangement_reproducible_diag.py
+
+它只在复制出的诊断配置中做以下处理，不修改原始配置：
+- reset 时同步 seed Python random。
+- reset 时同步 seed NumPy global RNG。
+- 把 randomize_distractor_slots 移到 fork/spoon 初始化之后，避免旧 episode 物体状态改变餐具初始化前的 RNG 消耗。
+
+重复验证 seed=209652396 两次：
+- fork 初始 pose 差异：0
+- spoon 初始 pose 差异：0
+- plate 初始 pose 差异：0
+- step0 raw action 最大差异：约 1.22e-6 m
+- 公共 140 步 raw action 最大差异：约 3.29e-5 m
+- 两次均成功
+
+验证记录：
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/repro_seed209652396_repeat2.jsonl
+
+注意：该包装器解决了场景初始化的历史依赖，但底层物理/渲染仍可能存在约 1e-5～4e-5 量级的小非确定性。靠近阈值的 episode 仍可能发生成功/失败翻转，所以应称为“场景可复现”，不要称为完全 bit-exact。
+
+
+======================================================================
+四、修正后评估结果
+======================================================================
+
+1. 非可复现旧流程、但 joint IDs 已修正后的 20-seed 结果
+
+- clear：18/20 = 90%
+- random：17/20 = 85%
+- gripper_not_opened：0
+- ineffective_grasp：0
+- fork/spoon not lifted：0
+- random 的 3 个失败均为 both_lifted_but_not_placed
+
+文件：
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/table_rearrangement_multiseed_original_ids_summary.csv
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/table_rearrangement_multiseed_original_ids.csv
+
+三个失败的终点 XY 误差：
+- seed=209652396：fork 0.057965 m，spoon 0.019818 m
+- seed=398764591：fork 0.038470 m，spoon 0.012608 m
+- seed=1537364731：fork 0.032387 m，spoon 0.053774 m
+
+误差方向并不一致，因此不能用一个统一的全局 Cartesian 偏置解释，也不建议直接加固定 X/Y 补偿。
+
+
+2. 可复现包装器下的正式 random 20-seed 结果
+
+- clear 对照：18/20 = 90%
+- random：17/20 = 85%
+
+random 的三个失败：
+
+- episode=3，trace_index=2，seed=924231285
+  分类：spoon_not_lifted
+  fork lift=0.052888 m
+  spoon lift=0.000744 m
+  fork final error=0.064236 m
+  spoon final error=0.148329 m
+  min right link6-to-spoon=0.164315 m
+
+- episode=12，trace_index=11，seed=1650906866
+  分类：both_lifted_but_not_placed
+  fork lift=0.105919 m
+  spoon lift=0.056039 m
+  fork final error=0.010069 m
+  spoon final error=0.039506 m
+  min right link6-to-spoon=0.139646 m
+
+- episode=13，trace_index=12，seed=1879422756
+  分类：spoon_not_lifted
+  fork lift=0.103670 m
+  spoon lift=0.0000379 m
+  fork final error=0.013210 m
+  spoon final error=0.153953 m
+  min right link6-to-spoon=0.157740 m
+
+文件：
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/table_rearrangement_multiseed_reproducible_summary.csv
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/table_rearrangement_multiseed_reproducible.csv
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/multiseed_random_reproducible_physical_n50.jsonl
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/multiseed_random_reproducible_physical_n50.console.log
+
+
+3. 可复现失败视频验证
+
+seed=924231285：
+- 单独运行与正式 20-seed 基线的初始 fork/spoon/plate pose 完全一致。
+- 第一步 raw action 差异约 1e-5。
+- 稳定失败。
+
+视频：
+/home/user/Robotsynchallenge/RoboSynChallenge/eval_result/table_rearrangement/act_table_rearrangement_diag/random/reproducible_failure_video/seed924231285_physical_n50/2026-08-21_16-02-00/videos/episode_000_seed_924231285_fail.mp4
+
+seed=1879422756：
+- 初始场景与正式基线完全一致。
+- raw action 差异约 1.62e-5。
+- 稳定失败。
+
+视频：
+/home/user/Robotsynchallenge/RoboSynChallenge/eval_result/table_rearrangement/act_table_rearrangement_diag/random/reproducible_failure_video/seed1879422756_physical_n50/2026-08-21_16-03-13/videos/episode_000_seed_1879422756_fail.mp4
+
+seed=1650906866：
+- 初始场景一致。
+- raw action 差异约 4.216e-5。
+- 正式基线中是严格阈值失败；单独运行 150 步时变为成功。
+- 说明它是接近 3.5 cm 严格 XY 阈值的敏感边界案例，不是稳定失败。
+
+视频：
+/home/user/Robotsynchallenge/RoboSynChallenge/eval_result/table_rearrangement/act_table_rearrangement_diag/random/reproducible_failure_video/seed1650906866_physical_n50/2026-08-21_16-02-47/videos/episode_000_seed_1650906866_success.mp4
+
+
+======================================================================
+五、spoon 初始 X 相关性及其 A/B 反证
+======================================================================
+
+在正式可复现 random 20-seed 样本中观察到：
+- 初始 spoon_x < 0.45：2/5 成功
+- 初始 spoon_x >= 0.45：15/15 成功
+
+三个失败恰好是 spoon_x 最低的三个样本：
+- 约 0.4382
+- 约 0.4214
+- 约 0.4024
+
+这个现象最初提示低 spoon_x 可能是风险区。但后续定向 A/B 否定了“spoon_x 单因素就是根因”的结论：
+
+- edge 组，spoon_x=[0.40,0.45]，10 episodes：9/10
+- interior 组，spoon_x=[0.45,0.65]，10 episodes：9/10
+- 两组都是 episode 3、seed=924231285 这一相同 episode 失败，其余都成功。
+
+文件：
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/spoon_x_edge_040_045_physical_n50.jsonl
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/spoon_x_edge_040_045_physical_n50.console.log
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/spoon_x_interior_045_065_physical_n50.jsonl
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/spoon_x_interior_045_065_physical_n50.console.log
+
+结论：
+- 低 spoon_x 在那组 20 样本中只是一个相关性/风险信号，不是充分原因。
+- 不要据此裁剪 spoon_x 采样范围。
+- 不要添加统一 X 方向补偿。
+- 相同 seed 在 edge/interior 两组均失败，说明更值得比较的是两组保留下来的共同因素。
+
+
+======================================================================
+六、grasp_z=-0.008 为什么目前不是优先项
+======================================================================
+
+配置中的 grasp_z=-0.008 主要用于 expert/action bank 生成，不会在 ACT 推理时动态修改模型输出。
+
+因此，直接修改该参数不会改变当前 checkpoint 在 ACT eval 中输出的动作，除非重新生成 expert 数据并重新训练。
+
+另外，两个稳定失败中 link6 到 spoon 的 z 相对量与成功案例接近，视频也显示是从 spoon 侧面错过，不是高度撞桌。
+
+当前不建议优先继续调整 grasp_z；应该先定位导致同 seed episode 3 横向预测错误的视觉/姿态共同因素。
+
+
+======================================================================
+七、新增诊断代码与用途
+======================================================================
+
+主要诊断目录：
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act_table_rearrangement_diag
+
+关键文件：
+
+1. deploy_policy.py
+   - 夹爪物理动作直发
+   - raw/env/qpos 等诊断记录入口
+
+2. strict_task.py
+   - 严格成功判定与失败分类
+
+3. config_patch.py
+   - 复制并修改诊断配置
+   - 当前 joint IDs 已恢复为正确的 list(range(12))
+
+4. analyze_multiseed.py
+   - 多 seed 日志汇总和失败分类
+
+5. analyze_reproducible_spoon_alignment.py
+   - spoon 与右手 approach 对齐分析
+
+6. eval_random_reproducible_20.sh
+   - 可复现 random 20-seed 正式测试入口
+
+7. eval_reproducibility_repeat.sh
+   - 同 seed 重复运行、验证场景一致性
+
+8. eval_reproducible_failure_videos.sh
+   - 为可复现失败 seed 录制视频
+
+9. eval_spoon_x_ab.sh
+   - spoon_x edge/interior A/B 测试
+
+其他新增脚本：
+
+/home/user/Robotsynchallenge/RoboSynChallenge/scripts/eval_table_rearrangement_diag.py
+/home/user/Robotsynchallenge/RoboSynChallenge/scripts/eval_table_rearrangement_reproducible_diag.py
+/home/user/Robotsynchallenge/RoboSynChallenge/scripts/eval_table_rearrangement_spoon_x_diag.py
+/home/user/Robotsynchallenge/RoboSynChallenge/scripts/probe_table_rearrangement_random_reset_events.py
+
+
+======================================================================
+八、作废或不应继续用于结论的旧产物
+======================================================================
+
+1. 旧的 multiseed_random_physical_n50 结果
+   原因：使用了错误 joint IDs，reset 时会把 left_eef 当成 arm joint 随机化。
+   旧的 15/20=75% 和左夹爪异常相关结论均作废。
+
+2. random_gripper_reset_physical_n50.jsonl
+   原因：这是尝试在 sync 后强制 reset 夹爪的中断实验，约 episode 3 就被停止，文件不完整。
+   该方案也没有稳定保持，不得作为修复方案。
+
+3. 旧 failed_seed_video 目录下的 standalone fixed-seed 视频
+   原因：当时尚未修复 Python/NumPy seed 与事件顺序，单独运行的餐具初始场景与原连续运行不一致。
+   不得用于对原失败做因果判断。
+
+4. “spoon_x<0.45 就是根因”的说法
+   原因：edge/interior 定向 A/B 两组结果均为 9/10，而且相同 episode 3 失败。
+   只能把低 x 当成旧 20 样本中的相关信号。
+
+
+======================================================================
+九、下一窗口最推荐的排查顺序
+======================================================================
+
+下一步不要再重复夹爪缩放、n_action_steps 或抓取 z 实验。最有信息量的工作是围绕 seed=924231285 的“edge/interior 都失败”做成对分析。
+
+第一步：扩展 reset 和逐步日志
+
+在新诊断文件中记录以下信息，不修改原代码：
+- 完整 raw 14D model action
+- 完整发送给环境的 14D action
+- 左右臂全部 qpos/qvel
+- 左右夹爪物理 qpos
+- fork/spoon/plate 的 position + quaternion
+- spoon 与右 wrist/link6 的逐步相对 XYZ
+- top camera、right wrist camera 的 intrinsics/extrinsics
+- 图像 hash 或保存关键帧
+- distractor 的 identity、pose 和可见性/遮挡情况
+- reset 后右臂初始 qpos
+
+重点对比：
+- edge 组 episode 3 / seed=924231285
+- interior 组 episode 3 / seed=924231285
+- 相邻成功 episode
+
+因为改变 spoon_x 后同一 episode 仍失败，优先寻找两组共享的因素：
+- spoon_y
+- spoon yaw/orientation
+- camera intrinsics/extrinsics
+- 右腕相机视角或遮挡
+- distractor 类型/位置
+- 右臂初始 qpos
+- fork 先行动作对后续 spoon 阶段状态的影响
+
+
+第二步：做单因素、保持 RNG 消耗一致的消融
+
+建议依次测试：
+1. camera extrinsics 随机化范围设为 0。
+2. camera intrinsics 随机化范围设为 0。
+3. 固定 spoon yaw，但保持 x/y 随机。
+4. 固定 distractor 或使用确定 distractor 布局。
+5. 固定右臂初始 qpos，保留其他随机项。
+
+重要：为了维持可比性，不要简单删除随机事件。最好把随机范围设成零或固定值，使事件仍执行并消耗相同数量/顺序的 RNG；否则可能再次因为 RNG 序列漂移而得到不可比场景。
+
+
+第三步：确定因素后再决定修复策略
+
+如果失败来自特定相机扰动、遮挡或姿态区域，更合理的正式修复通常是：
+- 对问题区域定向补充训练数据；
+- 增加相应视觉/姿态增强；
+- 平衡低覆盖场景的采样；
+- 必要时修正 observation/camera 配置。
+
+目前证据不支持以下做法：
+- 全局增加固定 X/Y Cartesian 偏置；
+- 裁掉 spoon_x<0.45 的任务分布；
+- 把 n_action_steps 降到 5 或 1；
+- 继续把 grasp_z 当作主因；
+- 再次修改原始 arm joint IDs。
+
+
+第四步：最终统计
+
+找到并实现有根据的修复后：
+- 使用可复现包装器；
+- 保持 n_action_steps=50；
+- 保持夹爪物理动作直发；
+- 保持 arm event IDs=[0..11]；
+- 使用严格 success；
+- 至少跑 50～100 episodes，再报告成功率与失败类型分布。
+
+20 episodes 的样本量较小，而且存在接近 3.5 cm 阈值的边界案例，不能只凭 1～2 个 episode 判断正式修复有效。
+
+
+======================================================================
+十、建议的运行入口
+======================================================================
+
+进入仓库：
+cd /home/user/Robotsynchallenge/RoboSynChallenge
+
+重新运行可复现 random 20-seed：
+bash policy/act_table_rearrangement_diag/eval_random_reproducible_20.sh
+
+同 seed 重复验证：
+bash policy/act_table_rearrangement_diag/eval_reproducibility_repeat.sh
+
+生成稳定失败视频：
+bash policy/act_table_rearrangement_diag/eval_reproducible_failure_videos.sh
+
+重新跑 spoon_x A/B：
+bash policy/act_table_rearrangement_diag/eval_spoon_x_ab.sh
+
+注意：执行前应先阅读各脚本顶部参数，确认 checkpoint、GPU、episode 数量和输出目录符合当前环境，避免覆盖已有诊断输出。
+
+
+======================================================================
+十一、交接用一句话结论
+======================================================================
+
+夹爪不开已经通过取消二次缩放解决，arm joint IDs 原配置本来就是正确的，n_action_steps=50 应保留；当前真正需要定位的是 seed=924231285 等稳定失败中，模型为何在 spoon 阶段产生约 8 cm 的 X 向接近误差。spoon_x 本身已被 A/B 证明不是充分原因，下一步应比较 edge/interior 同一失败 episode 共有的 spoon_y/yaw、相机扰动、遮挡、distractor 和右臂初始状态，并用保持 RNG 顺序一致的单因素消融来锁定根因。
+
+
+======================================================================
+十二、2026-08-21 继续排查：单因素消融结果
+======================================================================
+
+本轮仍未修改官方任务、官方配置或原 policy。所有改动都放在新建的诊断脚本、诊断 policy 和日志中。
+
+新增的诊断入口：
+
+/home/user/Robotsynchallenge/RoboSynChallenge/scripts/eval_table_rearrangement_factor_diag.py
+/home/user/Robotsynchallenge/RoboSynChallenge/scripts/probe_table_rearrangement_reproducible_factors.py
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act_table_rearrangement_factor_diag/
+
+逐步日志新增记录：
+- raw 14D action 与实际发送的 14D action
+- 16D qpos/qvel、归一化 robot state、物理夹爪开度
+- fork/spoon/plate 的完整 pose
+- spoon 到右 link6、fork 到左 link6 的相对 XYZ
+- 三个相机的实际 intrinsics 和 pose
+- distractor identity/pose
+- 可选图像 SHA256
+
+所有消融均保留原 reset event；随机范围归零而不是删除事件，以尽量保持 RNG 调用顺序一致。distractors_hidden 仍执行抽样、位置和 yaw 采样，只把最终 appear_probs 设为 0。
+
+
+1. seed=924231285 单因素结果
+
+baseline：
+- FAIL，361 steps
+- spoon 最大抬升 0.000144 m
+- 最近接时 spoon-right_link6 相对 XYZ = [-0.08529, -0.02815, -0.13755] m
+- 初始 spoon=(0.438198, -0.299885)，yaw=-1.17 deg
+- cam_high fx=648.9586，比标称 606.3152 高 42.6434（约 +7.0%）
+
+distractors_hidden：
+- FAIL，361 steps
+- spoon 最大抬升 0.000519 m
+- 最近接时 X 误差仍为 -0.08670 m
+- baseline 中两个可见干扰物都在 x=0.918/0.931 附近，远离预测抓取落点
+
+结论：隐藏干扰物不能修复该失败，distractor 不是这一稳定偏差的充分原因。
+
+camera_intrinsics_zero：
+- SUCCESS，160 steps
+- spoon 最大抬升 0.091997 m
+
+camera_fx_zero：
+- SUCCESS，160 steps
+- spoon 最大抬升 0.092721 m
+- 最近接时 spoon-right_link6 平面误差约 [0.03035, -0.00254] m
+
+camera_fy_zero：
+- FAIL，361 steps
+- spoon 最大抬升 0.02138 m
+- 最近接 X 误差仍约 -0.0584 m
+
+spoon_y_center：
+- SUCCESS，170 steps
+- spoon 最大抬升 0.104873 m
+- 最近接时 spoon-right_link6 平面误差约 [0.01704, 0.00326] m
+
+结论：该 seed 中真正有因果信息的是 cam_high 的 fx 和 spoon_y；只关闭 fy 不足以修复。
+
+
+2. seed=1879422756 单因素结果
+
+baseline：
+- FAIL，361 steps
+- spoon 最大抬升仅 0.0000468 m
+- 最近接 X 误差 -0.07618 m
+- 初始 spoon=(0.402428, -0.291733)，yaw=-19.19 deg
+- cam_high fx=625.9396，比标称值高 19.6244
+
+camera_fx_zero 单次：
+- SUCCESS，140 steps
+- spoon 最大抬升 0.07900 m
+- 最近接 X 误差改善到 -0.02803 m
+
+spoon_y_center 单次：
+- SUCCESS，140 steps
+- spoon 最大抬升 0.10732 m
+- 最近接 X 误差改善到 +0.01216 m
+
+两个稳定失败 seed 的 spoon yaw 分别约 -1.2 deg 和 -19.2 deg，并不共享极端 yaw，因此 yaw 不是当前首要解释。
+
+
+======================================================================
+十三、20-seed 分布证据与完整 fx 对照
+======================================================================
+
+reset-only 20-seed 探针确认：
+
+- spoon_y < -0.29：0/2 成功，两个样本正好是 seed=924231285、1879422756。
+- spoon_y >= -0.29：17/18 成功；唯一失败是原来的放置边界 seed=1650906866。
+- fx 高于标称值的 12 个样本中有 10 个原本成功，所以高 fx 单独并不足以导致失败。
+- 其他更高 fx 样本在 spoon_y 约 -0.255 时仍可成功。
+
+因此，当前样本最支持的是交互效应：
+
+    spoon 位于负 y 分布边界 + cam_high 正向 fx 扰动
+
+而不是 spoon_x、yaw、distractor 或一个全局固定 Cartesian 偏置。
+
+随后运行完整 20-seed camera_fx_zero 对照，其他条件保持一致：
+
+- baseline：17/20 = 85%
+- camera_fx_zero：19/20 = 95%
+
+具体变化：
+- episode 3 / seed=924231285：spoon_not_lifted -> SUCCESS
+- episode 12 / seed=1650906866：placement failure -> SUCCESS
+- episode 13 / seed=1879422756：仍 FAIL，本轮表现为 pick failure
+
+这说明固定 fx 到标称值有明显收益，但不能把它称为稳定的正式修复。
+
+
+======================================================================
+十四、边界 seed 的独立进程重复结果
+======================================================================
+
+为解释 seed=1879422756 在单次 fx-zero 中成功、在连续 20-seed 中失败的差异，补做了独立进程重复：
+
+baseline，3 次：
+- 0/3 成功
+- 3/3 都是 spoon pick failure
+- spoon 最大抬升只有约 0.000037～0.000048 m
+
+camera_fx_zero，5 次：
+- 2/5 严格成功
+- 5/5 都已把 fork 和 spoon 抬起，pick failure 被消除
+- 3 次失败全部变成 placement boundary failure
+- 三次失败最终 spoon 平面误差分别为 35.70、35.07、35.29 mm
+- 严格阈值是 35.00 mm，只超出 0.07～0.70 mm
+
+spoon_y_center，3 次：
+- 3/3 成功
+- spoon 从约 y=-0.291733 移到 y=-0.224966
+- 最终 spoon 平面误差只有约 6.37～7.40 mm
+
+同场景不同运行的初始物体 pose 和相机参数一致；robot qpos 只出现约 1e-6 量级差异，但首个模型动作已有约 1e-3 量级差异。该样本位于策略和严格 35 mm 判据的双重边界，小的仿真/观测差异可能让轨迹分叉。
+
+更新后的判断：
+
+1. 负 y 边界覆盖不足是更根本的问题。
+2. 正向 fx 扰动会放大视觉空间偏差，是重要的交互因素，但不是唯一因素。
+3. fx 归零能把“完全抓不到”改善为“能抓到但贴着放置阈值”，所以只是诊断性缓解。
+4. 不能用单次 fixed-seed 成功宣称问题已修复；边界 seed 必须重复运行。
+
+
+======================================================================
+十五、另一个独立配置问题：cam_high extrinsics 随机化实际未生效
+======================================================================
+
+random/gym_config.json 中 cam_high 使用 look-at 配置：
+
+    extrinsics = eye / target / up
+
+但 random_camera_high_extrinsics 事件传入的是：
+
+    pos_range / euler_range
+
+EmbodiChain 的 randomize_camera_extrinsics 实现规定：
+- attach/parent 相机才读取 pos_range/euler_range；
+- look-at 相机只读取 eye_range/target_range/up_range。
+
+因此当前 cam_high extrinsics 事件对实际相机 pose 是 no-op，也不会在该分支为 pos/euler 采样。日志中 20 个 seed 的 cam_high pose 完全一致，与代码审计相符。
+
+这不是当前两个 spoon 失败的直接原因，因为训练/评测都处在同一个 no-op 配置下；但它意味着原先预期的顶视相机外参增强并不存在。将其修正会引入新的观测分布，必须单独建配置、重新生成/补充数据并重新训练，不能和当前因果实验混在一起。
+
+
+======================================================================
+十六、当前最推荐的正式修复与验证路径
+======================================================================
+
+不建议把 camera_fx_zero 或裁掉 spoon_y<-0.29 直接作为最终提交修复。这两种做法都只是收窄评测分布，无法提升策略本身的鲁棒性。
+
+建议按以下顺序推进：
+
+1. 针对 spoon_y=[-0.30, -0.29] 定向补数据，重点覆盖 cam_high fx 从标称值到 +50 的组合；不要只补中心区域。
+2. 对边界数据做平衡采样或加权，避免少量极端 y 样本被大量中心样本淹没。
+3. 微调/重训后恢复完整 focal_x_range=[-50, 50]，先复测两个失败 seed，每个至少重复 5 次。
+4. 再跑至少 50～100 个可复现随机 episode，并按 pick failure、placement boundary 分开统计。
+5. 单独建立正确使用 eye_range/target_range/up_range 的相机外参实验；只有配套训练数据后才纳入正式配置。
+
+本轮产物：
+
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/table_rearrangement_factor_ab_summary.csv
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/reproducible_reset_factors_20.csv
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/table_rearrangement_fx_zero_20_summary.csv
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/table_rearrangement_seed1879422756_repeat_summary.csv
+
+
+======================================================================
+十七、更新后的交接用一句话结论
+======================================================================
+
+两个稳定 spoon 失败是负 y 边界与 cam_high 正向 fx 扰动共同放大的视觉空间鲁棒性问题：隐藏 distractor 和只关闭 fy 都无效，关闭 fx 可把 20-seed 从 17/20 提高到 19/20，却仍不能稳定修复 seed=1879422756；把 spoon_y 移回中心则重复 3/3 成功，因此正式方案应补齐负 y 边界 × fx 扰动的训练覆盖，并在完整随机范围下做多次、50～100 episode 验证，而不是裁剪任务分布或增加固定 Cartesian 偏置。
+
+
+======================================================================
+十八、2026-08-21 定向边界数据采集与微调准备进度
+======================================================================
+
+本轮按以下三个目标继续操作：
+
+1. 定向补充 spoon_y=[-0.30,-0.29] × cam_high 正向 fx 扰动数据并微调。
+2. 两个边界 seed 每个至少用独立进程重复 5 次，作为快速验收门槛。
+3. 边界稳定后，恢复完整 focal_x_range=[-50,50] 进行回归。
+
+本轮仍未修改官方任务、官方配置、原数据集或原 checkpoint。采集时只在运行时深拷贝 random/gym_config.json，将 spoon y 限定到 [-0.30,-0.29]，将 cam_high focal_x 扰动限定到 [0,+50]，并写入新的隔离目录。
+
+
+1. 新增工具
+
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/table_rearrangement_boundary/collect_boundary_fx.py
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/table_rearrangement_boundary/collect_boundary_fx_parallel_93.sh
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/table_rearrangement_boundary/finetune_boundary_replay.py
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/table_rearrangement_boundary/eval_boundary_seeds_5x.sh
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/table_rearrangement_boundary/eval_full_fx_20.sh
+
+采集器的严格保存条件为：
+- fork 和 spoon 最大抬升都不小于 0.02 m；
+- 最终平面误差都不大于 0.035 m；
+- 最终 z 误差不大于 0.035 m；
+- 目标区域连续命中至少 5 帧；
+- 专家轨迹逆解失败或严格条件不通过时拒绝保存并自动重试。
+
+
+2. 边界数据采集结果
+
+最终使用的干净分片为 v2+v3+v4+v5：
+- v2：31 episodes / 6200 frames / 93 videos
+- v3：31 episodes / 6200 frames / 93 videos
+- v4：31 episodes / 6200 frames / 93 videos
+- v5：7 episodes / 1400 frames / 21 videos
+- 合计：100 episodes / 20000 frames / 300 videos
+
+整体尝试 105 次，成功保存 100 次，拒收 5 次。拒收回合都是专家动作生成/逆解失败，没有写入训练数据。
+
+100 个有效 episode 的实际覆盖：
+- spoon_y：-0.2999182045 ～ -0.2900609374 m，100/100 位于指定边界区间。
+- cam_high fx：607.0897827 ～ 656.1267080，100/100 为相对标称值的正向扰动。
+- fork 最大抬升：0.1016470 ～ 0.1031272 m。
+- spoon 最大抬升：0.1038991 ～ 0.1052395 m。
+- fork 最终平面误差最大 0.0027347 m。
+- spoon 最终平面误差最大 0.0013188 m。
+- 100/100 的最大目标连续命中都为 44 帧。
+
+数据目录：
+
+/home/user/Robotsynchallenge/RoboSynChallenge/lerobot_dataset/table_rearrangement_boundary_fx_v2/cobotmagic_Sim_table_rearrangement_boundary_y_fxpos_000
+/home/user/Robotsynchallenge/RoboSynChallenge/lerobot_dataset/table_rearrangement_boundary_fx_v3/cobotmagic_Sim_table_rearrangement_boundary_y_fxpos_000
+/home/user/Robotsynchallenge/RoboSynChallenge/lerobot_dataset/table_rearrangement_boundary_fx_v4/cobotmagic_Sim_table_rearrangement_boundary_y_fxpos_000
+/home/user/Robotsynchallenge/RoboSynChallenge/lerobot_dataset/table_rearrangement_boundary_fx_v5/cobotmagic_Sim_table_rearrangement_boundary_y_fxpos_000
+
+采集日志：
+
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/table_boundary_fx_collect31_v2.console.log
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/table_boundary_fx_collect31_v3.console.log
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/table_boundary_fx_collect31_v4.console.log
+/home/user/Robotsynchallenge/RoboSynChallenge/diagnostic_logs/table_boundary_fx_collect7_v5.console.log
+
+早先的 v1 分片只有 7 个完整 episode，且留有一个未完成 parquet，因为当时中断而没有完成全局统计；它不再纳入上述 100 个干净样本。
+
+
+3. 当前阻塞点：LeRobot 全局统计未生成
+
+采集分片已有以下完整内容：
+- meta/info.json
+- meta/episodes.jsonl
+- meta/episodes_stats.jsonl
+- meta/tasks.jsonl
+- 每个 episode 的 parquet 和 3 路视频
+- boundary_fx_provenance.json
+
+但 v2～v5 都缺少 meta/stats.json。原因是 EmbodiChain 旧版 recorder 与当前 LeRobot 0.3.3 的 finalize 接口不兼容；本轮的兼容层保证了 episode 和视频可写入，但 finalize 的 no-op 没有生成全局 stats.json。
+
+安全合并脚本 scripts/merge_lerobot_v21.py 在读取缺失的 stats.json 时立即退出，因此：
+- 未生成半成品的 1200-episode 混合数据集；
+- 尚未启动微调；
+- 尚未对两个边界 seed 执行各 5 次验收；
+- 尚未恢复 focal_x_range=[-50,50] 跑完整回归。
+
+这些项目在本文档中明确标记为“未完成”，不能把采集成功等同于策略已修复。
+
+
+4. 下一步操作顺序
+
+1. 修正统计生成：从每个分片已有的 episodes_stats.jsonl 按 count/mean/std 正确汇总，生成新的可合并输出，不修改原分片。
+2. 将原 1100 episodes 与边界 100 episodes 合并为独立的 1200-episode 回放数据集，预期为 240000 frames / 3600 videos。
+3. 验证合并数据的 schema、统计量、episode 索引、视频路径和 LeRobotDataset 实际加载。
+4. 从 outputs/act_table_rearrangement_mixed1100_bs8_v0/checkpoints/080000/pretrained_model 以 lr=1e-6、batch_size=8 微调 10000 steps，每 2500 steps 保存 checkpoint。
+5. 使用选定 checkpoint 对 seed=924231285 和 seed=1879422756 分别独立重复 5 次；只有两个 seed 都稳定通过才进入完整范围回归。
+6. 恢复原 random/gym_config.json 的 focal_x_range=[-50,50]，先跑 20-seed 回归，再决定是否扩展到 50～100 episodes。
+
+
+======================================================================
+十九、本轮当前交接结论
+======================================================================
+
+spoon_y=[-0.30,-0.29] × cam_high 正向 fx 扰动的 100 个严格成功专家 episode 已采集完成，范围和轨迹质量均通过检查；但因 LeRobot 0.3.3 兼容层未生成 meta/stats.json，1200-episode 混合数据尚未生成，微调、两个边界 seed 各 5 次验收和完整 focal_x_range=[-50,50] 回归仍待执行。

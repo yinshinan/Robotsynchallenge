@@ -1,0 +1,4 @@
+variant,episodes,left_joint_id,right_joint_id,left_open_count,left_max_qpos_m,left_target_open_count,left_max_current_target_error_m,left_max_sync_change_m,left_max_obs_change_m,right_open_count,right_max_qpos_m,right_target_open_count,right_max_current_target_error_m,right_max_sync_change_m,right_max_obs_change_m
+baseline,20,12,14,0,3.486994160084578e-07,0,5.256924850982614e-07,0.0,0.0,0,4.994839173377841e-07,0,4.994839173377841e-07,0.0,0.0
+no_qpos_random,20,12,14,0,1.483544735947362e-07,0,1.52585485579948e-07,0.0,0.0,0,6.187070766827674e-08,0,9.189399463593872e-08,0.0,0.0
+no_robot_random,20,12,14,0,-6.230751026237158e-09,0,6.316275946716132e-09,0.0,0.0,0,-2.3504272306240637e-08,0,2.432942736163568e-08,0.0,0.0

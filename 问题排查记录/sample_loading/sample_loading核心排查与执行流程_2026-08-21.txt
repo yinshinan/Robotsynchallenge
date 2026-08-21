@@ -1,0 +1,297 @@
+sample_loading 核心排查与执行流程
+整理日期：2026-08-21
+
+说明
+====
+
+本文由 2026-08-19 至 2026-08-21 的 6 份排查、评估、清洗、V2 采集和跨服务器执行文档精简而成。
+原文档、原任务代码、旧数据和旧模型均不修改。
+
+
+一、当前结论
+============
+
+1. 失败不是动作顺序写反，而是固定时序缺少物理状态确认：
+   - 右夹爪尚未稳定夹住，右臂已经上抬；
+   - 左夹爪尚未稳定承载，右夹爪已经松开；
+   - 到达料架后经常没有完成释放和稳定停留。
+
+2. 原 ACT checkpoint：chunk_size=50、n_action_steps=50、25 Hz，相当于连续开环执行 2 秒。
+   长开环会跨过抓取、交接等关键阶段；但 n_action_steps 过小也会破坏模型学到的动作相位，
+   n=1 会反复执行动作块开头并趋于静止，因此不能简单理解为越小越好。
+
+3. 原 1100 条数据的关键夹爪切换时序完全一致：
+   - 右闭合：step 78；左闭合：step 228；右张开：step 244；左张开：step 335；
+   - 左闭合到右张开仅 16 帧（0.64 秒）；
+   - 闭合到位后的有效保持约 6 帧（0.24 秒）；
+   - 没有时序扰动、接触确认和失败恢复。
+
+4. qf 在旧数据、V2 数据和运行时均为全零。不能伪造，也不能作为安全门控依据。
+   当前可执行方案是在新模型训练时使用 --drop-qf，从输入中移除该无信息字段；
+   这不等于仿真器已经具备真实接触力。
+
+5. 原 success 判据曾因速度 API 和末端距离读取失败而静默跳过部分约束。
+   后续评估必须使用独立严格评估入口，不能再用旧 success rate 判断模型可部署性。
+
+
+二、已经完成的验证
+==================
+
+1. 原模型严格评估（每组 50 回合，同 seed 序列）：
+
+   n_action_steps    抬起       到料架5cm    严格成功
+   8                 19/50      4/50         0/50
+   10                28/50      9/50         1/50
+   12                27/50      9/50         1/50
+   15                30/50      11/50        2/50
+
+   结论：严格成功率只有 0%–4%。n=15 仅为点估计较高，不能证明显著优于 10/12；
+   继续只搜索 n_action_steps 不能解决问题。
+
+2. 旧数据严格质量门：
+   - 总数：1100；保留：838；拒绝：262；custom 保留：0/100；
+   - 主要拒绝原因：最终高度不合格 137、稳定尾段不足 124、XY 超限 3；
+   - 旧数据继续存在固定时序和全零 qf。
+
+3. clean838 微调 20k 后，最佳 15k checkpoint 在 n=15 下仍为 2/50（4%），
+   与原模型相同。交接和到架有所改善，但到架后的稳定释放没有改善。
+   结论：停止在旧数据或 clean838 上继续追加训练。
+
+4. V2 链路验证已完成：
+   - 时序随机化有效；mixed 配额为 nominal 40%、抓取恢复 25%、交接恢复 20%、释放恢复 15%；
+   - 恢复轨迹插入 23 帧失败—回退—重试动作；
+   - 释放后在线稳定目标为 25–30 帧；
+   - 在线速度门已改为 25 Hz 位姿差分，与离线审计口径一致；
+   - V3→V2.1 只读转换、严格审计和 --drop-qf 训练冒烟均已通过。
+
+5. 本机曾采到 108 条后人工中断。由于 LeRobot V3 的 ParquetWriter 未正常 finalize，
+   data 和 meta/episodes parquet 缺少 footer，报错“Parquet magic bytes not found in footer”。
+   该批次只作诊断，不得修补、转换、计数或训练；另一服务器必须重新完整采 200 条，不是 92 条。
+
+
+三、统一质量门（任何一项不满足都停止训练）
+==========================================
+
+每条 episode 必须满足：
+
+- 最终 cube-to-rack XY < 0.035 m；
+- 最终相对 rack 高度在 0.040–0.075 m；
+- 最终竖直倾角 <= 10 度；
+- 轨迹中物体至少抬高 0.03 m；
+- 最终左右夹爪均释放；
+- 物体速度 < 0.05 m/s 的连续稳定尾段 >= 25 帧；
+- action、qpos、qvel、qf、cube_pose、rack_pose 均为有限数值；
+- 200 条 duration schedule 全部唯一；
+- 类别配额严格为 80/50/40/30；
+- 恢复插入帧只能为 nominal 的 0 帧或恢复轨迹的 23 帧；
+- selection_valid=true、kept=200、rejected=0；
+- all_qf_zero=true 只能作为已知警告，训练必须 --drop-qf；
+- fixed_gripper_timing=false。
+
+禁止通过降低阈值、删除失败样本、伪造 qf 或修改物理/动作配置来凑齐数据。
+
+
+四、当前唯一正确的下一步：另一服务器完整采 200 条
+==================================================
+
+工程目录：
+  /home/user/Robotsynchallenge/RoboSynChallenge
+
+需要同步且只允许使用的新增入口：
+  policy/act/sample_loading/collect_sample_loading_v2.py
+  policy/act/sample_loading/convert_sample_loading_v2_readonly.py
+  policy/act/sample_loading/build_sample_loading_quality_manifest.py
+  policy/act/sample_loading/train_sample_loading_clean_subset.py
+
+前三个远端执行入口的 SHA-256 必须分别为：
+  632a420ef78c2e0dcfd80e04f29da25b6ae1ae31d9919b933a93086cff06c3b0  collect_sample_loading_v2.py
+  30e83999a43d00a17f8b71f920c56214a510d9e803b62c2e53817162c1221936  convert_sample_loading_v2_readonly.py
+  2ae688ccae271032bb6314e0a0a39492b5d081f9681a7e5782d5cf7f8fff31c8  build_sample_loading_quality_manifest.py
+
+从本机同步前三个入口到新服务器（替换 NEW_SERVER）：
+
+NEW_SERVER='user@NEW_SERVER'
+rsync -av \
+  policy/act/sample_loading/collect_sample_loading_v2.py \
+  policy/act/sample_loading/convert_sample_loading_v2_readonly.py \
+  policy/act/sample_loading/build_sample_loading_quality_manifest.py \
+  "$NEW_SERVER:/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/sample_loading/"
+
+不得覆盖：
+  robosynchallenge/tasks/sample_loading/sample_loading.py
+  robosynchallenge/tasks/sample_loading/action_bank.py
+  configs/sample_loading/action_config.json
+  configs/sample_loading/random/gym_config.json
+
+在新服务器进入工程根目录，并在 tmux 中运行：
+
+cd /home/user/Robotsynchallenge/RoboSynChallenge
+mkdir -p logs/sample_loading_v2
+set -o pipefail
+LOG_FILE="logs/sample_loading_v2/remote_full200_seed132001_$(date +%Y%m%d_%H%M%S).log"
+
+../.venv/bin/python policy/act/sample_loading/collect_sample_loading_v2.py \
+  --setting random \
+  --mode mixed \
+  --episodes 200 \
+  --v2-seed 132001 \
+  --stable-tail-min 25 \
+  --stable-tail-max 30 \
+  --max-attempts 12000 \
+  --headless 2>&1 | tee "$LOG_FILE"
+
+test "${PIPESTATUS[0]}" -eq 0
+
+必须看到：
+  [V2 SAVED] 200/200
+  [V2 COMPLETE] ... episodes=200
+
+采集期间禁止 Ctrl-C、kill、移动正在写入的目录或降低稳定阈值。
+
+
+五、新服务器完成后的最小验证、转换与审计
+========================================
+
+先设置本次新目录，不要指向本机中断批次：
+
+SRC_DATASET='lerobot_dataset/sample_loading_v2/本次新V3目录'
+DATASET_NAME="$(basename "$SRC_DATASET")"
+DEST_DATASET="lerobot_dataset/sample_loading_v2_train/${DATASET_NAME}_remote_full200_v21"
+AUDIT_DIR="eval_result/sample_loading/data_quality/${DATASET_NAME}_remote_full200"
+
+test "$(jq -r '.total_episodes' "$SRC_DATASET/meta/info.json")" -eq 200
+test "$(jq -r '.saved_episodes' "$SRC_DATASET/sample_loading_v2_provenance.json")" -eq 200
+
+验证全部 parquet 可读：
+
+../.venv/bin/python - "$SRC_DATASET" <<'PY'
+import sys
+from pathlib import Path
+import pyarrow.parquet as pq
+root = Path(sys.argv[1])
+paths = sorted((root / "data").rglob("*.parquet")) + sorted((root / "meta/episodes").rglob("*.parquet"))
+assert paths
+for path in paths:
+    assert pq.ParquetFile(path).metadata.num_rows > 0
+print("parquet OK", len(paths))
+PY
+
+只读转换和严格审计：
+
+test ! -e "$DEST_DATASET"
+test ! -e "$AUDIT_DIR"
+
+../.venv/bin/python policy/act/sample_loading/convert_sample_loading_v2_readonly.py \
+  "$SRC_DATASET" "$DEST_DATASET"
+
+policy/act/.venv/bin/python policy/act/sample_loading/build_sample_loading_quality_manifest.py \
+  "$DEST_DATASET" "$AUDIT_DIR" --min-stable-tail-frames 25
+
+最终门禁，必须退出 0：
+
+jq -e '
+  .selection_valid == true and
+  .source_episode_count == 200 and
+  .kept_episode_count == 200 and
+  .rejected_episode_count == 0 and
+  .dataset_warnings.all_qf_zero == true and
+  .dataset_warnings.fixed_gripper_timing == false
+' "$AUDIT_DIR/clean_v1_manifest.json"
+
+若 rejected 不为 0：保留 V3、V2.1、审计目录和日志；不要降低阈值，不要回传为“合格数据”，
+先依据 rejected_episodes.jsonl 排查。
+
+
+六、传回本机并进行第二次独立验证
+================================
+
+只传 V3、审计结果、日志和 SHA-256 清单；V2.1 在本机重新生成。
+传输到独立目录，不能覆盖本机已有数据：
+
+在新服务器生成 V3 逐文件清单：
+
+SRC_PARENT="$(dirname "$SRC_DATASET")"
+CHECKSUM_FILE="/tmp/${DATASET_NAME}.sha256"
+(
+  cd "$SRC_PARENT"
+  find "$DATASET_NAME" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$CHECKSUM_FILE"
+)
+test -s "$CHECKSUM_FILE"
+
+RETURN_ROOT='/home/user/Robotsynchallenge/RoboSynChallenge/lerobot_dataset/sample_loading_v2_remote_return'
+
+rsync -avh --partial --append-verify --info=progress2 \
+  "$SRC_DATASET/" \
+  "user@OLD_SERVER:$RETURN_ROOT/$DATASET_NAME/"
+
+rsync -avh --info=progress2 \
+  "$CHECKSUM_FILE" \
+  "user@OLD_SERVER:$RETURN_ROOT/${DATASET_NAME}.sha256"
+
+回到本机后必须完成：
+
+1. 用远端生成的 sha256 清单执行 sha256sum -c，所有文件均显示 OK；
+2. 再次确认 info/provenance 均为 200；
+3. 再次读取全部 parquet footer；
+4. 从回传 V3 重新生成新的本机 V2.1；
+5. 重新生成本机 manifest，不能直接拿远端绝对路径的 manifest 训练；
+6. 再次满足 selection_valid=true、kept=200、rejected=0、
+   all_qf_zero=true、fixed_gripper_timing=false 后，数据才正式可用。
+
+
+七、新数据通过后才允许训练
+==========================
+
+训练输入只能使用：
+
+- 回传且 SHA-256 验证通过的全新 V3 200 条；
+- 本机从该 V3 只读生成的 V2.1；
+- 本机重新审计生成的 clean_v1_manifest.json。
+
+训练必须：
+
+- 使用 train_sample_loading_clean_subset.py；
+- 带 --drop-qf；
+- 使用全新输出目录；
+- 不混入旧 1100、clean838、本机中断 108 条或任何 rejected episode；
+- 不覆盖旧 checkpoint。
+
+先做训练冒烟，再进行多 seed 正式训练。若冒烟凭证未显示 drop_qf=true、
+selected_episodes=200 或源数据指纹不一致，立即停止。
+
+
+八、新模型严格复评流程
+======================
+
+1. 用独立严格评估入口，不使用原任务的旧 success 判据。
+2. 先用同一 seed 序列筛选 n_action_steps=10、12、15；每个候选先跑小规模回合。
+3. 按抓起、右手保持、到交接、到料架、双手释放、连续稳定六阶段统计，不只看最终 success。
+4. 最优 checkpoint/执行步数至少跑 100 个随机回合，并报告 Wilson 95% 置信区间。
+5. 只有达到项目验收阈值，且“到架未稳定释放”不再是主要失败项，才可进入真实机器人安全门控测试。
+
+
+九、最终可用与禁用清单
+======================
+
+可用：
+- 正常完成、双重审计 200/200 通过的远端新数据；
+- 本机重新生成的 V2.1 和 manifest；
+- 使用 --drop-qf 训练得到的新 checkpoint；
+- 严格评估入口及其阶段统计结果。
+
+禁用：
+- 旧 1100 条数据和 clean838 继续追加训练；
+- 本机中断的 random_mixed_001（108 条、parquet footer 缺失）；
+- random_mixed_001_cutover_108_v21；
+- 所有 rejected episode；
+- 全零 qf 作为接触反馈；
+- 旧 success rate 作为部署依据；
+- 仅通过调 n_action_steps 宣称问题已解决。
+
+
+一句话执行决策
+==============
+
+保留旧数据和旧模型作基线但不再训练；在另一服务器不间断完整采集 200 条随机时序、稳定尾段和
+失败恢复 V2 数据，远端及本机两次严格审计均达到 200/200 后，使用 --drop-qf 训练新模型，
+最后以同 seed、分阶段、至少 100 回合的严格评估决定是否可部署。

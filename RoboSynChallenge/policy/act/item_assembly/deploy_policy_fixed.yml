@@ -1,0 +1,36 @@
+# Non-invasive item_assembly evaluation configuration.
+# Use with eval_item_assembly_fixed.py; original files are not modified.
+policy_name: act
+task_name: item_assembly
+setting: random
+model_name: null
+seed: 0
+max_episodes: 5
+max_steps: 361
+headless: true
+pytorch_device: cuda
+filter_dataset_saving: true
+eval_video_log: true
+eval_video_obs_keys:
+  - cam_high
+  - cam_right_wrist
+  - cam_left_wrist
+eval_reset_sync_steps: 1
+eval_freeze_interval_events: true
+item_assembly_alignment_assist: true
+
+checkpoint_path: null
+act_step: 10
+n_action_steps: null
+action_chunk_offset: 0
+state_obs_path: robot/qpos
+strict_action_dim: true
+neutralize_qvel: false
+neutralize_left_gripper_state: true
+debug_button_press: false
+debug_trajectory: false
+debug_trajectory_steps: 100
+image_key_map:
+  observation.images.cam_high: cam_high
+  observation.images.cam_right_wrist: cam_right_wrist
+  observation.images.cam_left_wrist: cam_left_wrist

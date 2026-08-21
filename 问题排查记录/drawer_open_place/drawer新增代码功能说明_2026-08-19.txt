@@ -1,0 +1,108 @@
+RoboSynChallenge 抽屉任务新增代码功能说明
+日期：2026-08-19
+项目目录：/home/user/Robotsynchallenge/RoboSynChallenge
+
+======================================================================
+1. eval_drawer_strict_completion.py
+======================================================================
+
+路径：
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/eval_drawer_strict_completion.py
+
+功能：
+- 对 drawer_open_place checkpoint 做固定 seed 的严格完整流程评测。
+- 每个 seed 使用一个全新的仿真器进程，避免前一回合状态影响下一回合。
+- 按顺序检查：稳定抓取、到达投放区、左夹爪松开、物体稳定、抽屉关闭。
+- 忽略官方“物体刚靠近抽屉”的提前成功信号。
+- 保存原始 action、环境 action、robot qpos、夹爪状态、抽屉关节位移和物体位置。
+- 输出每个 seed 的 trace.csv、summary.json，以及整体成功率汇总；可选保存视频。
+
+主要用途：
+- 公平比较不同 checkpoint。
+- 诊断单个失败 seed 的具体失败阶段。
+
+======================================================================
+2. eval_drawer_strict_continuous.py
+======================================================================
+
+路径：
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/eval_drawer_strict_continuous.py
+
+功能：
+- 在同一个仿真器进程和同一个已加载模型中连续运行 20 回合。
+- 使用与严格隔离评测相同的完整流程成功判据。
+- 每回合只 reset 环境和模型状态，不重新创建仿真器或重新加载 checkpoint。
+- 保存每回合完整轨迹、汇总结果和视频。
+
+主要用途：
+- 模拟正式部署时的连续运行方式。
+- 检查环境状态累积、重复 reset 或长时间运行是否导致性能下降。
+
+依赖：
+- 复用 eval_drawer_strict_completion.py 中的环境构造、模型加载和判定工具。
+
+======================================================================
+3. train_drawer_strict_completion_weighted.py
+======================================================================
+
+路径：
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/train_drawer_strict_completion_weighted.py
+
+功能：
+- 对抽屉任务执行第三阶段 ACT 专项微调。
+- 从第二阶段 dual-phase 005000 checkpoint 开始训练。
+- 保留抓取和放置/释放阶段权重，同时增加关抽屉阶段权重。
+
+核心训练窗口：
+- 50~150：强化抓取阶段。
+- 200~320：强化放置和左夹爪释放阶段。
+- 320~425：强化右臂关抽屉和右夹爪动作。
+
+动作权重：
+- 强化左臂 action[0:6]。
+- 强化真实左夹爪张开目标 action[6]。
+- 在关抽屉窗口强化右臂 action[7:13]。
+- 强化真实右夹爪张开目标 action[13]。
+
+主要用途：
+- 生成最终第三阶段 005000/010000/015000/020000 checkpoint。
+- 修复抓取后不松手以及右臂关抽屉不稳定的问题。
+
+依赖：
+- 使用 train_drawer_weighted.py 提供的数据字段兼容功能。
+
+======================================================================
+4. train_drawer_weighted.py
+======================================================================
+
+路径：
+/home/user/Robotsynchallenge/RoboSynChallenge/policy/act/train_drawer_weighted.py
+
+功能：
+- 最初用于第一阶段抓取窗口加权微调。
+- 为旧 LeRobot 数据字段建立内存别名，使数据字段与当前 ACT checkpoint 配置兼容。
+- 提供不修改原始数据集的数据包装器和元数据兼容层。
+- 支持按 frame_index 设置样本权重，并对左臂动作维度设置额外 L1 权重。
+
+当前保留原因：
+- 第三阶段训练脚本直接复用其中的数据字段常量、数据包装器和别名生成函数。
+- 删除该文件会导致 train_drawer_strict_completion_weighted.py 无法导入和训练。
+
+======================================================================
+文件关系
+======================================================================
+
+训练：
+train_drawer_weighted.py
+  -> 为 train_drawer_strict_completion_weighted.py 提供数据兼容层
+  -> 生成第三阶段 checkpoint
+
+评测：
+eval_drawer_strict_completion.py
+  -> 提供隔离 seed 严格评测及公共评测工具
+  -> 被 eval_drawer_strict_continuous.py 复用
+  -> 对最终 checkpoint 做连续 20 回合部署压力测试
+
+最终抽屉专用 checkpoint：
+/home/user/Robotsynchallenge/RoboSynChallenge/outputs/act_drawer_strict_completion_ft_from_dual005_lr1e6_20260819/checkpoints/005000/pretrained_model
+
